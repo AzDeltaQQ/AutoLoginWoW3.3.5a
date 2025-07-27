@@ -10,6 +10,15 @@
 #include <iomanip>
 #include "config.h"
 
+// Client state enumeration based on IsLoading? global variable
+enum ClientState {
+    DISCONNECTED,       // IsLoading == 0
+    LOGGING_IN,         // IsLoading == 1 (Authenticating to BNet)
+    SELECTING_REALM,    // IsLoading == 4 (Realm List is up)
+    CONNECTING_TO_REALM,// IsLoading == 2 (In transition to game server)
+    AUTHENTICATED       // auth_flag == 1 (At character select)
+};
+
 class Logger {
 private:
     std::ofstream logFile;
@@ -147,46 +156,30 @@ public:
         return VirtualFreeEx(processHandle, (LPVOID)address, 0, MEM_RELEASE);
     }
 
-    bool InitiateLogin() {
-        Log("Calling processServerLogin function at 0x4D8A30...", false);
-        
-        DWORD remoteAccount = AllocateRemoteMemory(accountName.length() + 1);
-        DWORD remotePassword = AllocateRemoteMemory(password.length() + 1);
-        if (!remoteAccount || !remotePassword) { 
-            Log("Failed to allocate memory for credentials.", false);
-            return false; 
-        }
-
-        WriteString(remoteAccount, accountName);
-        WriteString(remotePassword, password);
-
-        // This function is __cdecl(char* account, char* password)
+    // Generic __cdecl remote call
+    bool CallCdeclFunction(DWORD functionAddr, const std::vector<DWORD>& args) {
         std::vector<BYTE> stub;
-        DWORD funcAddr = PROCESS_SERVER_LOGIN_FUNC;
-
-        // push password_ptr
-        stub.push_back(0x68);
-        stub.insert(stub.end(), (BYTE*)&remotePassword, (BYTE*)&remotePassword + 4);
-        // push account_ptr
-        stub.push_back(0x68);
-        stub.insert(stub.end(), (BYTE*)&remoteAccount, (BYTE*)&remoteAccount + 4);
+        // push arguments
+        for (auto it = args.rbegin(); it != args.rend(); ++it) {
+            stub.push_back(0x68); // PUSH
+            DWORD arg = *it;
+            stub.insert(stub.end(), (BYTE*)&arg, (BYTE*)&arg + 4);
+        }
         // mov eax, functionAddr
         stub.push_back(0xB8);
-        stub.insert(stub.end(), (BYTE*)&funcAddr, (BYTE*)&funcAddr + 4);
+        stub.insert(stub.end(), (BYTE*)&functionAddr, (BYTE*)&functionAddr + 4);
         // call eax
         stub.push_back(0xFF);
         stub.push_back(0xD0);
-        // add esp, 8 (cdecl cleanup)
-        stub.push_back(0x83); stub.push_back(0xC4); stub.push_back(0x08);
+        // add esp, X (cdecl cleanup)
+        if (!args.empty()) {
+            stub.push_back(0x83); stub.push_back(0xC4); stub.push_back(args.size() * sizeof(DWORD));
+        }
         // ret
         stub.push_back(0xC3);
-
+        
         DWORD stubAddr = AllocateRemoteMemory(stub.size());
-        if (!stubAddr) { 
-            FreeRemoteMemory(remoteAccount);
-            FreeRemoteMemory(remotePassword);
-            return false; 
-        }
+        if (!stubAddr) return false;
         
         WriteProcessMemory(processHandle, (LPVOID)stubAddr, stub.data(), stub.size(), NULL);
         HANDLE thread = CreateRemoteThread(processHandle, NULL, 0, (LPTHREAD_START_ROUTINE)stubAddr, NULL, 0, NULL);
@@ -198,77 +191,156 @@ public:
         }
         
         FreeRemoteMemory(stubAddr);
-        FreeRemoteMemory(remoteAccount);
-        FreeRemoteMemory(remotePassword);
-        
         return success;
     }
 
-    bool SelectRealm(const std::string& realmName) {
-        Log("Waiting for NetClient pointer to be created by login process...", false);
-        DWORD pNetClient = 0;
-        for (int i = 0; i < 15; i++) {
-            pNetClient = ReadMemory<DWORD>(NETCLIENT_PTR_ADDR);
-            if (pNetClient && pNetClient != 0xFFFFFFFF) break;
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+    // Generic __thiscall remote call
+    bool CallThiscallFunction(DWORD functionAddr, DWORD thisPtr, const std::vector<DWORD>& args) {
+        std::vector<BYTE> stub;
+        // mov ecx, thisPtr
+        stub.push_back(0xB9);
+        stub.insert(stub.end(), (BYTE*)&thisPtr, (BYTE*)&thisPtr + 4);
+        // push arguments
+        for (auto it = args.rbegin(); it != args.rend(); ++it) {
+            stub.push_back(0x68); // PUSH
+            DWORD arg = *it;
+            stub.insert(stub.end(), (BYTE*)&arg, (BYTE*)&arg + 4);
         }
-        if (!pNetClient) {
-             Log("NetClient pointer was not created. Login may have failed.", false);
-             return false;
+        // mov eax, functionAddr
+        stub.push_back(0xB8);
+        stub.insert(stub.end(), (BYTE*)&functionAddr, (BYTE*)&functionAddr + 4);
+        // call eax
+        stub.push_back(0xFF);
+        stub.push_back(0xD0);
+        // ret (callee cleanup for __thiscall)
+        stub.push_back(0xC3);
+        
+        DWORD stubAddr = AllocateRemoteMemory(stub.size());
+        if (!stubAddr) return false;
+        
+        WriteProcessMemory(processHandle, (LPVOID)stubAddr, stub.data(), stub.size(), NULL);
+        HANDLE thread = CreateRemoteThread(processHandle, NULL, 0, (LPTHREAD_START_ROUTINE)stubAddr, NULL, 0, NULL);
+        
+        bool success = (thread != NULL);
+        if (thread) {
+            WaitForSingleObject(thread, FUNCTION_CALL_TIMEOUT * 1000);
+            CloseHandle(thread);
         }
+        
+        FreeRemoteMemory(stubAddr);
+        return success;
+    }
 
-        Log("Waiting for realm list...", false);
-        for (int i = 0; i < REALM_LIST_TIMEOUT; i++) {
-            if (ReadMemory<int>(pNetClient + REALM_COUNT_OFFSET) > 0) break;
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
+    bool InitiateLogin() {
+        Log("Setting last realm CVar and calling processServerLogin...", false);
+        
+        // --- STEP 1: Set the 'realmName' CVar. This is a critical prerequisite. ---
+        DWORD remoteRealmName = AllocateRemoteMemory(accountName.length() + 1); // Use accountName buffer temporarily
+        if (!remoteRealmName) return false;
+        // The actual realm list isn't available, but the CVar is often used for the login packet header.
+        // We'll use a placeholder or the target realm name. For now, we use a placeholder.
+        WriteString(remoteRealmName, "Kezan"); // Must match a real realm on the server
+        
+        // Call resume_last_realm(char* realm)
+        CallCdeclFunction(RESUME_LAST_REALM_FUNC, { remoteRealmName });
+        FreeRemoteMemory(remoteRealmName);
+
+        // --- STEP 2: Call the main login function as before. ---
+        DWORD remoteAccount = AllocateRemoteMemory(accountName.length() + 1);
+        DWORD remotePassword = AllocateRemoteMemory(password.length() + 1);
+        if (!remoteAccount || !remotePassword) return false;
+
+        WriteString(remoteAccount, accountName);
+        WriteString(remotePassword, password);
+        
+        bool success = CallCdeclFunction(PROCESS_SERVER_LOGIN_FUNC, { remoteAccount, remotePassword });
+        
+        FreeRemoteMemory(remoteAccount);
+        FreeRemoteMemory(remotePassword);
+        return success;
+    }
+
+    // THIS IS THE DEFINITIVE REALM SELECTION FUNCTION
+    bool SelectRealm(const std::string& realmName) {
+        DWORD pNetClient = ReadMemory<DWORD>(NETCLIENT_PTR_ADDR);
+        if (!pNetClient) return false;
         
         int realmCount = ReadMemory<int>(pNetClient + REALM_COUNT_OFFSET);
-        if (realmCount <= 0) {
-            Log("Timeout or error waiting for realm list.", false);
-            return false;
-        }
-        
+        if (realmCount <= 0) return false;
+
         DWORD realmArray = ReadMemory<DWORD>(pNetClient + REALM_LIST_PTR_OFFSET);
         for (int i = 0; i < realmCount; i++) {
             char currentRealmName[64] = {0};
-            ReadProcessMemory(processHandle, (LPCVOID)(realmArray + (i * REALM_STRUCT_SIZE) + REALM_NAME_OFFSET), currentRealmName, sizeof(currentRealmName)-1, NULL);
+            DWORD realmEntryAddr = realmArray + (i * REALM_STRUCT_SIZE);
+            ReadProcessMemory(processHandle, (LPCVOID)(realmEntryAddr + REALM_NAME_OFFSET), currentRealmName, sizeof(currentRealmName)-1, NULL);
 
             if (_stricmp(currentRealmName, realmName.c_str()) == 0) {
-                Log("Found realm '" + realmName + "'. Connecting...", false);
-                // processBNetAuthPacket is __thiscall
-                std::vector<BYTE> stub;
-                DWORD funcAddr = PROCESS_BNET_AUTH_PACKET;
-                DWORD realmIndex = i;
+                Log("Found realm '" + realmName + "'. Selecting via FrameScript_Execute...", false);
 
-                stub.push_back(0xB9); // mov ecx, pNetClient
-                stub.insert(stub.end(), (BYTE*)&pNetClient, (BYTE*)&pNetClient + 4);
-                stub.push_back(0x68); // push realmIndex
-                stub.insert(stub.end(), (BYTE*)&realmIndex, (BYTE*)&realmIndex + 4);
-                stub.push_back(0xB8); // mov eax, funcAddr
-                stub.insert(stub.end(), (BYTE*)&funcAddr, (BYTE*)&funcAddr + 4);
-                stub.push_back(0xFF); // call eax
-                stub.push_back(0xD0);
-                stub.push_back(0xC3); // ret (this func is __thiscall, callee cleanup)
+                // Lua is 1-based, so we use i + 1. Category is 1.
+                std::string luaScript = "select_realm(1, " + std::to_string(i + 1) + ")";
 
-                DWORD stubAddr = AllocateRemoteMemory(stub.size());
-                if (!stubAddr) return false;
-                WriteProcessMemory(processHandle, (LPVOID)stubAddr, stub.data(), stub.size(), NULL);
-                HANDLE thread = CreateRemoteThread(processHandle, NULL, 0, (LPTHREAD_START_ROUTINE)stubAddr, NULL, 0, NULL);
-                WaitForSingleObject(thread, FUNCTION_CALL_TIMEOUT * 1000);
-                CloseHandle(thread);
-                FreeRemoteMemory(stubAddr);
-                return true;
+                DWORD remoteScript = AllocateRemoteMemory(luaScript.length() + 1);
+                DWORD remoteSourceName = AllocateRemoteMemory(16); // "AutoLogin" or similar
+                if (!remoteScript || !remoteSourceName) return false;
+
+                WriteString(remoteScript, luaScript);
+                WriteString(remoteSourceName, "AutoLogin");
+                
+                // FrameScript_Execute is __cdecl(char* code, char* sourceName, int 0)
+                bool success = CallCdeclFunction(FRAMESCRIPT_EXECUTE_FUNC, { remoteScript, remoteSourceName, 0 });
+                
+                FreeRemoteMemory(remoteScript);
+                FreeRemoteMemory(remoteSourceName);
+                return success;
             }
         }
         Log("Could not find realm: '" + realmName + "'", false);
         return false;
     }
 
-    bool CheckIsAuthenticated() {
+    ClientState GetClientState() {
+        // First, check the most definitive state: fully authenticated at char select.
         DWORD pClientConnection = ReadMemory<DWORD>(CLIENTCONNECTION_PTR_ADDR);
-        if (!pClientConnection || pClientConnection == 0xFFFFFFFF) return false;
-        return ReadMemory<uint8_t>(pClientConnection + AUTH_STATUS_FLAG_OFFSET) == 1;
+        if (pClientConnection && pClientConnection != 0xFFFFFFFF) {
+            if (ReadMemory<uint8_t>(pClientConnection + AUTH_STATUS_FLAG_OFFSET) == 1) {
+                return AUTHENTICATED;
+            }
+        }
+
+        // If not, check the global loading screen state variable.
+        DWORD loadingState = ReadMemory<DWORD>(IS_LOADING_ADDR);
+        switch (loadingState) {
+            case 1: return LOGGING_IN;
+            case 2: return CONNECTING_TO_REALM;
+            case 4: return SELECTING_REALM;
+            default: return DISCONNECTED;
+        }
+    }
+
+    // NEW FUNCTION: Gracefully resets the client UI
+    void ResetClientState() {
+        Log("Attempting to gracefully reset client state...", false);
+        DWORD pNetClient = ReadMemory<DWORD>(NETCLIENT_PTR_ADDR);
+        if (!pNetClient || pNetClient == 0xFFFFFFFF) {
+            Log("NetClient object no longer exists, no need to reset state.", true);
+            return;
+        }
+        
+        DWORD vtable = ReadMemory<DWORD>(pNetClient);
+        if (!vtable) return;
+        
+        DWORD resetFunc = ReadMemory<DWORD>(vtable + VTABLE_RESET_OFFSET);
+        if (!resetFunc) return;
+        
+        Log("Calling ResetLoginState virtual function.", true);
+        CallThiscallFunction(resetFunc, pNetClient, {});
+    }
+
+    // NEW FUNCTION TO HANDLE STUCK DIALOGS
+    void ClickCancelButton() {
+        Log("Sending 'Cancel' event to clear any stuck dialogs...", true);
+        CallCdeclFunction(ON_REALMLIST_CANCEL_FUNC, {});
     }
 
     void Run(const std::string& targetRealm) {
@@ -276,22 +348,47 @@ public:
         isRunning = true;
         Log("Starting main loop. Target realm: '" + targetRealm + "'", false);
 
+        bool hasBeenAuthenticated = false;
+
         while (isRunning) {
-            if (!CheckIsAuthenticated()) {
-                Log("\n--- Client not authenticated. Starting login sequence. ---", false);
-                
-                if (InitiateLogin()) {
-                    Log("Login request sent. Waiting for realm list...", false);
-                    if (SelectRealm(targetRealm)) {
-                        Log("Successfully connected to realm!", false);
-                    } else {
-                        Log("Failed to select realm after login attempt.", false);
+            ClientState currentState = GetClientState();
+
+            switch (currentState) {
+                case AUTHENTICATED:
+                    Log("Client is authenticated at character select. Monitoring...", true);
+                    hasBeenAuthenticated = true;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(DISCONNECT_CHECK_INTERVAL));
+                    break;
+
+                case LOGGING_IN:
+                case CONNECTING_TO_REALM:
+                    Log("Client is busy connecting. Waiting...", true);
+                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                    break;
+
+                case SELECTING_REALM:
+                    Log("Client is at realm selection. Attempting to select realm...", false);
+                    if (!SelectRealm(targetRealm)) {
+                        Log("Failed to send realm selection packet. Resetting.", false);
+                        ResetClientState();
                     }
-                }
-                std::this_thread::sleep_for(std::chrono::seconds(RECONNECT_DELAY));
-            } else {
-                Log("Client is authenticated. Monitoring...", true);
-                std::this_thread::sleep_for(std::chrono::milliseconds(DISCONNECT_CHECK_INTERVAL));
+                    std::this_thread::sleep_for(std::chrono::seconds(RECONNECT_DELAY));
+                    break;
+
+                case DISCONNECTED:
+                    Log("\n--- Client is disconnected. Starting login sequence. ---", false);
+                    
+                    // If we have been authenticated before, it means we disconnected.
+                    // If a dialog box is stuck, this will clear it.
+                    if (hasBeenAuthenticated) {
+                        ClickCancelButton();
+                        ResetClientState();
+                        std::this_thread::sleep_for(std::chrono::seconds(1)); // Give UI time to react
+                    }
+
+                    InitiateLogin();
+                    std::this_thread::sleep_for(std::chrono::seconds(RECONNECT_DELAY));
+                    break;
             }
         }
         Log("Auto-login loop stopped.", false);

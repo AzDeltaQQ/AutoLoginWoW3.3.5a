@@ -1,22 +1,25 @@
 #pragma once
 
-// The high-level internal function called by the UI's Lua script.
+// The high-level internal functions called by the UI's Lua script.
 #define PROCESS_SERVER_LOGIN_FUNC 0x4D8A30
+#define FRAMESCRIPT_EXECUTE_FUNC 0x819210 // The true function for running Lua code
+#define RESUME_LAST_REALM_FUNC 0x6B2DF0
 
-// Pointers and offsets needed AFTER login succeeds.
+// Pointers and offsets
 #define NETCLIENT_PTR_ADDR 0xC79CEC
 #define CLIENTCONNECTION_PTR_ADDR 0xC79CE0
+#define IS_LOADING_ADDR 0xB6AFA0
 #define AUTH_STATUS_FLAG_OFFSET 0x2F18
-#define PROCESS_BNET_AUTH_PACKET 0x8C80E0
 #define VTABLE_RESET_OFFSET 0x84
 #define REALM_COUNT_OFFSET 0x1144
 #define REALM_LIST_PTR_OFFSET 0x1148
 #define REALM_NAME_OFFSET 0x04
 #define REALM_STRUCT_SIZE 0x104
+#define ON_REALMLIST_CANCEL_FUNC 0x4DE4C0
 
 // Program Settings
 #define PROCESS_NAME "Project-Epoch.exe"
-#define REALM_LIST_TIMEOUT 30
+#define REALM_LIST_TIMEOUT 60
 #define FUNCTION_CALL_TIMEOUT 15
 #define DISCONNECT_CHECK_INTERVAL 1000
 #define RECONNECT_DELAY 5
