@@ -367,11 +367,24 @@ public:
                     break;
 
                 case SELECTING_REALM:
-                    Log("Client is at realm selection. Attempting to select realm...", false);
+                    Log("Client is at realm selection. Pausing to ensure UI is ready...", false);
+                    
+                    // ===================================================================
+                    // THE DEFINITIVE FIX
+                    // ===================================================================
+                    // Wait for a moment to prevent a race condition. The client has set
+                    // the state to 4, but its main thread might not have finished
+                    // populating the realm list data structures that Lua needs to read.
+                    // This short delay ensures everything is stable before we proceed.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+                    // ===================================================================
+
+                    Log("Attempting to select realm...", false);
                     if (!SelectRealm(targetRealm)) {
                         Log("Failed to send realm selection packet. Resetting.", false);
                         ResetClientState();
                     }
+                    // After calling SelectRealm, loop to let the state machine detect the change
                     std::this_thread::sleep_for(std::chrono::seconds(RECONNECT_DELAY));
                     break;
 
