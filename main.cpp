@@ -320,27 +320,27 @@ public:
     
     // THIS IS THE NEW, MORE ACCURATE STATE DETECTION
     ClientState GetClientState() {
-        // Priority 1: Read the game's own UI state string.
-        std::string stateStr = ReadGlobalString(GAMESTATE_STRING_ADDR);
-
-        if (stateStr == "charselect") {
+        // Priority 1: Read the game's own UI state string for definitive screens.
+        std::string stateStr = ReadGlobalString(GAME_STATE_STRING_ADDR);
+        if (stateStr == "charselect" || stateStr == "charcreate") {
             return CHARACTER_SELECT;
         }
-        
-        if (stateStr == "charcreate") {
-            // Handle character creation screen if necessary, for now treat as success
-            return CHARACTER_SELECT; 
-        }
 
-        // Priority 2: Check for an ACTIVE error dialog. An error code is only valid if a dialog is shown.
+        // Priority 2: Check for an active error dialog. This catches UI-driven errors.
         if (IsGlueDialogVisible()) {
             return ERROR_STATE;
         }
 
-        // Priority 3: Check the native connection object for intermediate network states.
+        // Priority 3: Check the native connection object for in-progress or failed network states.
         DWORD pClientConnection = ReadMemory<DWORD>(CLIENTCONNECTION_PTR_ADDR);
         if (pClientConnection && pClientConnection != 0xFFFFFFFF) {
             ClientOperation op = ReadMemory<ClientOperation>(pClientConnection + CCLIENTCONNECTION_OPERATION_OFFSET);
+            
+            // If the operation has failed but the dialog isn't up yet, it's still an error.
+            if (op == COP_FAILED) {
+                return ERROR_STATE;
+            }
+
             ConnectionStatus status = ReadMemory<ConnectionStatus>(pClientConnection + CCLIENTCONNECTION_STATUS_OFFSET);
 
             switch (op) {
@@ -358,12 +358,26 @@ public:
             }
         }
 
-        // Priority 4: If the state string is "login" and no dialogs are visible, we are at the login screen.
+        // Priority 4: THIS IS THE KEY FIX for the "server down" spam loop.
+        // If we were just attempting a login (m_loginAttempted is true) AND the connection object is now gone,
+        // we must check the global error variables before reverting to AT_LOGIN_SCREEN.
+        // The client sets these globals immediately upon connection failure.
+        if (m_loginAttempted) {
+            ClientOperation lastErrorOp = ReadMemory<ClientOperation>(GLUE_ERROR_OPERATION_ADDR);
+            if (lastErrorOp == COP_CONNECT || lastErrorOp == COP_AUTHENTICATE || lastErrorOp == COP_FAILED) {
+                 ConnectionStatus lastErrorStatus = ReadMemory<ConnectionStatus>(GLUE_ERROR_STATUS_ADDR);
+                 if (lastErrorStatus != STATUS_NONE && lastErrorStatus != AUTH_OK) {
+                    return ERROR_STATE;
+                 }
+            }
+        }
+
+        // Priority 5: If the state string is "login" and no other conditions are met, we are at the login screen.
         if (stateStr == "login") {
             return AT_LOGIN_SCREEN;
         }
         
-        // Fallback: If we're in an unknown state, assume we need to be at the login screen.
+        // Fallback if the state string is something unexpected (e.g., empty during init).
         return AT_LOGIN_SCREEN;
     }
 

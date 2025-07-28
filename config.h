@@ -14,10 +14,9 @@
 // --- Global Pointers & State Variables ---
 #define CLIENTCONNECTION_PTR_ADDR       0xC79CE0 // CClientConnection**
 #define NETCLIENT_PTR_ADDR              0xC79CEC // CNetClient** (Note: CClientConnection inherits from this)
-#define GLUE_LOGIN_STATE_ADDR           0xB6AFA0 // The g_LoginState enum (int)
-#define GAMESTATE_STRING_ADDR           0xB6A9E0 // The current UI screen (char*) e.g., "login", "charselect"
+#define GLUE_STATE_ADDR                 0xB6AFA0 // Replaces LOGIN_STATE_ADDR
+#define GAME_STATE_STRING_ADDR          0xB6A9E0 // The current UI screen (char*) e.g., "login", "charselect"
 #define IS_WORLD_LOADED_ADDR            0xBEBA40 // Set to 1 when in the 3D world (int)
-#define LOGIN_STATE_ADDR                0xB6AFA0 // The global "IsLoading?" variable. (Legacy, less reliable)
 #define GLUE_ERROR_OPERATION_ADDR       0xAC3DA4 // Stores the ClientOperation code of the last error.
 #define GLUE_ERROR_STATUS_ADDR          0xAC3DA0 // Stores the ConnectionStatus code of the last error.
 
@@ -35,7 +34,7 @@
 #define CCLIENTCONNECTION_STATUS_OFFSET     0x2F50
 
 // --- Program Settings ---
-#define PROCESS_NAME                    "WowExt.exe" // Disregarding Wow.exe change, keeping WowExt.exe
+#define PROCESS_NAME                    "Project-Epoch.exe" // Disregarding Wow.exe change, keeping WowExt.exe
 #define FUNCTION_CALL_TIMEOUT           5000      // Milliseconds
 #define DEBUG_OUTPUT                    1
 #define VERBOSE_LOGGING                 1
