@@ -8,16 +8,37 @@
 #include <fstream>
 #include <sstream>
 #include <iomanip>
+#include <time.h>
 #include "config.h"
 
-// Client state enumeration based on IsLoading? global variable
+// Enhanced client state enumeration with more detailed states
 enum ClientState {
-    DISCONNECTED,       // IsLoading == 0
-    LOGGING_IN,         // IsLoading == 1 (Authenticating to BNet)
-    SELECTING_REALM,    // IsLoading == 4 (Realm List is up)
-    CONNECTING_TO_REALM,// IsLoading == 2 (In transition to game server)
-    AUTHENTICATED       // auth_flag == 1 (At character select)
+    AT_LOGIN_SCREEN,      // Glue screen, no operations active.
+    CONNECTING_TO_AUTH,   // "Connecting" dialog is visible.
+    AUTH_SUCCESS,         // Successfully authenticated, downloading realm list.
+    REALM_LIST,           // Realm list is visible.
+    CONNECTING_TO_REALM,  // "Logging in to game server..."
+    CHARACTER_SELECT,     // Success! At character select screen.
+    ERROR_STATE           // An error dialog is visible.
 };
+
+// ClientOperation enum is now defined in config.h
+
+// ConnectionStatus enum is now defined in config.h
+
+// Helper to make logs more readable
+std::string StateToString(ClientState state) {
+    switch (state) {
+        case AT_LOGIN_SCREEN: return "AT_LOGIN_SCREEN";
+        case CONNECTING_TO_AUTH: return "CONNECTING_TO_AUTH";
+        case AUTH_SUCCESS: return "AUTH_SUCCESS";
+        case REALM_LIST: return "REALM_LIST";
+        case CONNECTING_TO_REALM: return "CONNECTING_TO_REALM";
+        case CHARACTER_SELECT: return "CHARACTER_SELECT";
+        case ERROR_STATE: return "ERROR_STATE";
+        default: return "UNKNOWN";
+    }
+}
 
 class Logger {
 private:
@@ -28,9 +49,11 @@ public:
     Logger() {
         // Create log file with timestamp
         auto now = std::chrono::system_clock::now();
-        auto time_t = std::chrono::system_clock::to_time_t(now);
+        time_t time_t_now = std::chrono::system_clock::to_time_t(now);
+        std::tm tm_now;
+        localtime_s(&tm_now, &time_t_now);
         std::stringstream ss;
-        ss << "WoWAutoLogin_" << std::put_time(std::localtime(&time_t), "%Y%m%d_%H%M%S") << ".log";
+        ss << "WoWAutoLogin_" << std::put_time(&tm_now, "%Y%m%d_%H%M%S") << ".log";
         logFileName = ss.str();
         
         logFile.open(logFileName, std::ios::out | std::ios::app);
@@ -50,10 +73,12 @@ public:
     void Log(const std::string& message, const std::string& level = "INFO") {
         if (logFile.is_open()) {
             auto now = std::chrono::system_clock::now();
-            auto time_t = std::chrono::system_clock::to_time_t(now);
+            auto time_t_now = std::chrono::system_clock::to_time_t(now);
+            std::tm tm_now;
+            localtime_s(&tm_now, &time_t_now);
             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
             
-            logFile << "[" << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S") 
+            logFile << "[" << std::put_time(&tm_now, "%Y-%m-%d %H:%M:%S") 
                    << "." << std::setfill('0') << std::setw(3) << ms.count() << "] "
                    << "[" << level << "] " << message << std::endl;
             logFile.flush();
@@ -75,14 +100,15 @@ private:
     std::string accountName;
     std::string password;
     bool isRunning;
+    bool m_loginAttempted; // The crucial internal state flag
     Logger logger;
+    ClientState lastState;
 
 public:
     static WoWAutoLogin* instance;
 
-public:
     WoWAutoLogin(const std::string& account, const std::string& pass)
-        : accountName(account), password(pass), isRunning(false) {
+        : accountName(account), password(pass), isRunning(false), m_loginAttempted(false), lastState((ClientState)-1) {
         processHandle = NULL;
         processId = 0;
     }
@@ -92,26 +118,26 @@ public:
         if (instance == this) instance = nullptr;
     }
 
-    void Log(const std::string& message, bool verbose = false) {
+    void Log(const std::string& message, const std::string& level = "INFO", bool verbose = false) {
         if (!verbose || (DEBUG_OUTPUT && VERBOSE_LOGGING)) {
-            logger.Log(message, verbose ? "VERBOSE" : "INFO");
+            logger.Log(message, level);
         }
     }
 
     bool AttachToProcess() {
-        Log("Attempting to attach to WoW process...");
+        Log("Attempting to attach to WoW process...", "INFO");
         processId = FindWoWProcess();
         if (processId == 0) {
-            Log("WoW process not found!", false);
+            Log("WoW process not found!", "ERROR");
             return false;
         }
 
         processHandle = OpenProcess(PROCESS_ALL_ACCESS, FALSE, processId);
         if (!processHandle) {
-            Log("Failed to open WoW process! IMPORTANT: Please run this program as an Administrator. Error: " + std::to_string(GetLastError()), false);
+            Log("Failed to open WoW process! IMPORTANT: Please run this program as an Administrator. Error: " + std::to_string(GetLastError()), "ERROR");
             return false;
         }
-        Log("Successfully attached to WoW process (PID: " + std::to_string(processId) + ")", false);
+        Log("Successfully attached to WoW process (PID: " + std::to_string(processId) + ")", "INFO");
         return true;
     }
 
@@ -121,7 +147,7 @@ public:
         if (!ReadProcessMemory(processHandle, (LPCVOID)address, &value, sizeof(T), NULL)) {
             std::stringstream ss;
             ss << "ReadProcessMemory FAILED at address 0x" << std::hex << address << ". Error: " << GetLastError();
-            Log(ss.str(), true);
+            Log(ss.str(), "VERBOSE", true);
         }
         return value;
     }
@@ -131,22 +157,21 @@ public:
     }
 
     DWORD AllocateRemoteMemory(size_t size) {
-        // THIS IS THE FIX. Change the memory protection flag.
         DWORD allocatedAddr = (DWORD)VirtualAllocEx(
             processHandle,
             NULL,
             size,
             MEM_COMMIT | MEM_RESERVE,
-            PAGE_EXECUTE_READWRITE // <-- CORRECTED FLAG
+            PAGE_EXECUTE_READWRITE
         );
         
         if (VERBOSE_LOGGING) {
             if (allocatedAddr) {
                 std::stringstream ss;
                 ss << "Allocated " << size << " bytes of EXECUTABLE memory at 0x" << std::hex << allocatedAddr;
-                Log(ss.str(), true);
+                Log(ss.str(), "VERBOSE", true);
             } else {
-                Log("Failed to allocate remote memory. Error: " + std::to_string(GetLastError()), true);
+                Log("Failed to allocate remote memory. Error: " + std::to_string(GetLastError()), "VERBOSE", true);
             }
         }
         return allocatedAddr;
@@ -232,23 +257,10 @@ public:
     }
 
     bool InitiateLogin() {
-        Log("Setting last realm CVar and calling processServerLogin...", false);
-        
-        // --- STEP 1: Set the 'realmName' CVar. This is a critical prerequisite. ---
-        DWORD remoteRealmName = AllocateRemoteMemory(accountName.length() + 1); // Use accountName buffer temporarily
-        if (!remoteRealmName) return false;
-        // The actual realm list isn't available, but the CVar is often used for the login packet header.
-        // We'll use a placeholder or the target realm name. For now, we use a placeholder.
-        WriteString(remoteRealmName, "Kezan"); // Must match a real realm on the server
-        
-        // Call resume_last_realm(char* realm)
-        CallCdeclFunction(RESUME_LAST_REALM_FUNC, { remoteRealmName });
-        FreeRemoteMemory(remoteRealmName);
-
-        // --- STEP 2: Call the main login function as before. ---
+        Log("Calling processServerLogin function...", "ACTION");
         DWORD remoteAccount = AllocateRemoteMemory(accountName.length() + 1);
         DWORD remotePassword = AllocateRemoteMemory(password.length() + 1);
-        if (!remoteAccount || !remotePassword) return false;
+        if (!remoteAccount || !remotePassword) { return false; }
 
         WriteString(remoteAccount, accountName);
         WriteString(remotePassword, password);
@@ -260,13 +272,15 @@ public:
         return success;
     }
 
-    // THIS IS THE DEFINITIVE REALM SELECTION FUNCTION
     bool SelectRealm(const std::string& realmName) {
         DWORD pNetClient = ReadMemory<DWORD>(NETCLIENT_PTR_ADDR);
         if (!pNetClient) return false;
         
         int realmCount = ReadMemory<int>(pNetClient + REALM_COUNT_OFFSET);
-        if (realmCount <= 0) return false;
+        if (realmCount <= 0) {
+             Log("Realm count is zero or invalid.", "WARN");
+             return false;
+        }
 
         DWORD realmArray = ReadMemory<DWORD>(pNetClient + REALM_LIST_PTR_OFFSET);
         for (int i = 0; i < realmCount; i++) {
@@ -275,19 +289,15 @@ public:
             ReadProcessMemory(processHandle, (LPCVOID)(realmEntryAddr + REALM_NAME_OFFSET), currentRealmName, sizeof(currentRealmName)-1, NULL);
 
             if (_stricmp(currentRealmName, realmName.c_str()) == 0) {
-                Log("Found realm '" + realmName + "'. Selecting via FrameScript_Execute...", false);
-
-                // Lua is 1-based, so we use i + 1. Category is 1.
-                std::string luaScript = "select_realm(1, " + std::to_string(i + 1) + ")";
-
+                Log("Found realm '" + realmName + "'. Selecting via FrameScript_Execute...", "ACTION");
+                std::string luaScript = "SelectRealm(" + std::to_string(i + 1) + ")";
+                
                 DWORD remoteScript = AllocateRemoteMemory(luaScript.length() + 1);
-                DWORD remoteSourceName = AllocateRemoteMemory(16); // "AutoLogin" or similar
+                DWORD remoteSourceName = AllocateRemoteMemory(16);
                 if (!remoteScript || !remoteSourceName) return false;
 
                 WriteString(remoteScript, luaScript);
                 WriteString(remoteSourceName, "AutoLogin");
-                
-                // FrameScript_Execute is __cdecl(char* code, char* sourceName, int 0)
                 bool success = CallCdeclFunction(FRAMESCRIPT_EXECUTE_FUNC, { remoteScript, remoteSourceName, 0 });
                 
                 FreeRemoteMemory(remoteScript);
@@ -295,116 +305,231 @@ public:
                 return success;
             }
         }
-        Log("Could not find realm: '" + realmName + "'", false);
+        Log("Could not find realm: '" + realmName + "'", "ERROR");
         return false;
     }
+    
+    // Removed old Lua functions that are no longer needed for state detection
+    // std::string ExecuteLuaAndGetString(const std::string& luaExpression) { /* ... */ }
+    // bool IsCharacterSelectVisible() { /* ... */ }
+    // bool IsGlueDialogVisible() { /* ... */ }
 
+    ConnectionStatus GetGlueErrorStatus() {
+        return ReadMemory<ConnectionStatus>(GLUE_ERROR_STATUS_ADDR);
+    }
+    
+    // THIS IS THE NEW, MORE ACCURATE STATE DETECTION
     ClientState GetClientState() {
-        // First, check the most definitive state: fully authenticated at char select.
+        // Priority 1: Read the game's own UI state string.
+        std::string stateStr = ReadGlobalString(GAMESTATE_STRING_ADDR);
+
+        if (stateStr == "charselect") {
+            return CHARACTER_SELECT;
+        }
+        
+        if (stateStr == "charcreate") {
+            // Handle character creation screen if necessary, for now treat as success
+            return CHARACTER_SELECT; 
+        }
+
+        // Priority 2: Check for an ACTIVE error dialog. An error code is only valid if a dialog is shown.
+        if (IsGlueDialogVisible()) {
+            return ERROR_STATE;
+        }
+
+        // Priority 3: Check the native connection object for intermediate network states.
         DWORD pClientConnection = ReadMemory<DWORD>(CLIENTCONNECTION_PTR_ADDR);
         if (pClientConnection && pClientConnection != 0xFFFFFFFF) {
-            if (ReadMemory<uint8_t>(pClientConnection + AUTH_STATUS_FLAG_OFFSET) == 1) {
-                return AUTHENTICATED;
+            ClientOperation op = ReadMemory<ClientOperation>(pClientConnection + CCLIENTCONNECTION_OPERATION_OFFSET);
+            ConnectionStatus status = ReadMemory<ConnectionStatus>(pClientConnection + CCLIENTCONNECTION_STATUS_OFFSET);
+
+            switch (op) {
+                case COP_CONNECT:
+                case COP_HANDSHAKE:
+                    return CONNECTING_TO_AUTH;
+                case COP_AUTHENTICATE:
+                    if (status == AUTH_OK) return AUTH_SUCCESS;
+                    return CONNECTING_TO_AUTH;
+                case COP_GET_REALMS:
+                    if (status == REALM_LIST_SUCCESS) return REALM_LIST;
+                    return AUTH_SUCCESS;
+                case COP_LOGIN_CHARACTER:
+                    return CONNECTING_TO_REALM;
             }
         }
 
-        // If not, check the global loading screen state variable.
-        DWORD loadingState = ReadMemory<DWORD>(IS_LOADING_ADDR);
-        switch (loadingState) {
-            case 1: return LOGGING_IN;
-            case 2: return CONNECTING_TO_REALM;
-            case 4: return SELECTING_REALM;
-            default: return DISCONNECTED;
-        }
-    }
-
-    // NEW FUNCTION: Gracefully resets the client UI
-    void ResetClientState() {
-        Log("Attempting to gracefully reset client state...", false);
-        DWORD pNetClient = ReadMemory<DWORD>(NETCLIENT_PTR_ADDR);
-        if (!pNetClient || pNetClient == 0xFFFFFFFF) {
-            Log("NetClient object no longer exists, no need to reset state.", true);
-            return;
+        // Priority 4: If the state string is "login" and no dialogs are visible, we are at the login screen.
+        if (stateStr == "login") {
+            return AT_LOGIN_SCREEN;
         }
         
-        DWORD vtable = ReadMemory<DWORD>(pNetClient);
-        if (!vtable) return;
-        
-        DWORD resetFunc = ReadMemory<DWORD>(vtable + VTABLE_RESET_OFFSET);
-        if (!resetFunc) return;
-        
-        Log("Calling ResetLoginState virtual function.", true);
-        CallThiscallFunction(resetFunc, pNetClient, {});
+        // Fallback: If we're in an unknown state, assume we need to be at the login screen.
+        return AT_LOGIN_SCREEN;
     }
 
-    // NEW FUNCTION TO HANDLE STUCK DIALOGS
-    void ClickCancelButton() {
-        Log("Sending 'Cancel' event to clear any stuck dialogs...", true);
-        CallCdeclFunction(ON_REALMLIST_CANCEL_FUNC, {});
+    std::string ReadGlobalString(DWORD address, size_t maxSize = 64) {
+        std::vector<char> buffer(maxSize);
+        if (ReadProcessMemory(processHandle, (LPCVOID)address, buffer.data(), maxSize, NULL)) {
+            // Ensure null termination
+            buffer[maxSize - 1] = '\0';
+            return std::string(buffer.data());
+        }
+        return "";
+    }
+
+    // Re-added Lua interaction functions
+    std::string ExecuteLuaAndGetString(const std::string& luaExpression) {
+        std::string tempVarName = "AutoLoginResultVar";
+        std::string scriptToRun = tempVarName + " = tostring(" + luaExpression + ")";
+
+        DWORD remoteScript = AllocateRemoteMemory(scriptToRun.length() + 1);
+        DWORD remoteSourceName = AllocateRemoteMemory(16);
+        if (!remoteScript || !remoteSourceName) {
+            if(remoteScript) FreeRemoteMemory(remoteScript);
+            if(remoteSourceName) FreeRemoteMemory(remoteSourceName);
+            return "";
+        }
+
+        WriteString(remoteScript, scriptToRun);
+        WriteString(remoteSourceName, "AutoLogin");
+        CallCdeclFunction(FRAMESCRIPT_EXECUTE_FUNC, { remoteScript, remoteSourceName, 0 });
+        FreeRemoteMemory(remoteScript);
+        FreeRemoteMemory(remoteSourceName);
+
+        const size_t bufferSize = 256;
+        DWORD remoteResultBuffer = AllocateRemoteMemory(bufferSize);
+        DWORD remoteVarName = AllocateRemoteMemory(tempVarName.length() + 1);
+        if (!remoteResultBuffer || !remoteVarName) {
+            if(remoteResultBuffer) FreeRemoteMemory(remoteResultBuffer);
+            if(remoteVarName) FreeRemoteMemory(remoteVarName);
+            return "";
+        }
+        
+        WriteString(remoteVarName, tempVarName);
+        CallCdeclFunction(FRAMESCRIPT_GETTEXT_FUNC, { remoteVarName, remoteResultBuffer, (DWORD)bufferSize });
+
+        char resultBuffer[bufferSize] = {0};
+        ReadProcessMemory(processHandle, (LPCVOID)remoteResultBuffer, resultBuffer, bufferSize - 1, NULL);
+
+        FreeRemoteMemory(remoteVarName);
+        FreeRemoteMemory(remoteResultBuffer);
+        
+        return std::string(resultBuffer);
+    }
+
+    bool IsGlueDialogVisible() {
+        std::string result = ExecuteLuaAndGetString("GlueDialog and GlueDialog:IsVisible()");
+        return result == "true";
+    }
+
+
+    void ResetLoginState() {
+        Log("Calling reset function to dismiss dialog and clear state...", "ACTION");
+        CallCdeclFunction(RESET_LOGIN_STATE_FUNC, {});
     }
 
     void Run(const std::string& targetRealm) {
         if (!AttachToProcess()) return;
         isRunning = true;
-        Log("Starting main loop. Target realm: '" + targetRealm + "'", false);
+        Log("Starting main loop. Target realm: '" + targetRealm + "'", "INFO");
 
-        bool hasBeenAuthenticated = false;
+        auto actionTimer = std::chrono::steady_clock::now();
+        bool realmSelectAttempted = false; // Add this flag
 
         while (isRunning) {
             ClientState currentState = GetClientState();
+            
+            if (currentState != lastState) {
+                Log("State changed to: " + StateToString(currentState), "STATE");
+                lastState = currentState;
+                actionTimer = std::chrono::steady_clock::now();
+            }
 
             switch (currentState) {
-                case AUTHENTICATED:
-                    Log("Client is authenticated at character select. Monitoring...", true);
-                    hasBeenAuthenticated = true;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(DISCONNECT_CHECK_INTERVAL));
-                    break;
-
-                case LOGGING_IN:
-                case CONNECTING_TO_REALM:
-                    Log("Client is busy connecting. Waiting...", true);
-                    std::this_thread::sleep_for(std::chrono::seconds(2));
-                    break;
-
-                case SELECTING_REALM:
-                    Log("Client is at realm selection. Pausing to ensure UI is ready...", false);
-                    
-                    // ===================================================================
-                    // THE DEFINITIVE FIX
-                    // ===================================================================
-                    // Wait for a moment to prevent a race condition. The client has set
-                    // the state to 4, but its main thread might not have finished
-                    // populating the realm list data structures that Lua needs to read.
-                    // This short delay ensures everything is stable before we proceed.
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-                    // ===================================================================
-
-                    Log("Attempting to select realm...", false);
-                    if (!SelectRealm(targetRealm)) {
-                        Log("Failed to send realm selection packet. Resetting.", false);
-                        ResetClientState();
+                case AT_LOGIN_SCREEN:
+                    if (!m_loginAttempted) {
+                        Log("Client is at login screen. Initiating login.", "INFO");
+                        InitiateLogin();
+                        m_loginAttempted = true; 
+                        realmSelectAttempted = false; // Reset realm selection flag on new login
                     }
-                    // After calling SelectRealm, loop to let the state machine detect the change
-                    std::this_thread::sleep_for(std::chrono::seconds(RECONNECT_DELAY));
                     break;
 
-                case DISCONNECTED:
-                    Log("\n--- Client is disconnected. Starting login sequence. ---", false);
-                    
-                    // If we have been authenticated before, it means we disconnected.
-                    // If a dialog box is stuck, this will clear it.
-                    if (hasBeenAuthenticated) {
-                        ClickCancelButton();
-                        ResetClientState();
-                        std::this_thread::sleep_for(std::chrono::seconds(1)); // Give UI time to react
+                case CONNECTING_TO_AUTH:
+                case CONNECTING_TO_REALM: {
+                    Log("Waiting for connection...", "VERBOSE", true);
+                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - actionTimer).count();
+                    if (elapsed > LOGIN_TIMEOUT) {
+                        Log("Connection timed out. Resetting state.", "WARN");
+                        ResetLoginState();
+                        m_loginAttempted = false; 
+                        std::this_thread::sleep_for(std::chrono::seconds(RECONNECT_DELAY));
                     }
+                    break;
+                }
 
-                    InitiateLogin();
-                    std::this_thread::sleep_for(std::chrono::seconds(RECONNECT_DELAY));
+                case ERROR_STATE: {
+                    DWORD pClientConnection = ReadMemory<DWORD>(CLIENTCONNECTION_PTR_ADDR);
+                    // Prioritize reading the more specific error code from the connection object if it exists
+                    ConnectionStatus status = pClientConnection ? 
+                                               ReadMemory<ConnectionStatus>(pClientConnection + CCLIENTCONNECTION_STATUS_OFFSET) : 
+                                               GetGlueErrorStatus();
+                    
+                    Log("Detected error state with ConnectionStatus: " + std::to_string(status), "ERROR");
+                    
+                    switch (status) {
+                        case RESPONSE_FAILED_TO_CONNECT:
+                        case RESPONSE_DISCONNECTED:
+                        case AUTH_LOGIN_SERVER_NOT_FOUND:
+                            Log("Error: Server seems to be down. Retrying in " + std::to_string(RECONNECT_DELAY) + "s.", "WARN");
+                            ResetLoginState();
+                            m_loginAttempted = false;
+                            std::this_thread::sleep_for(std::chrono::seconds(RECONNECT_DELAY));
+                            break;
+                        case AUTH_INCORRECT_PASSWORD:
+                        case AUTH_UNKNOWN_ACCOUNT:
+                        case AUTH_BANNED:
+                        case AUTH_SUSPENDED:
+                            Log("Error: Unrecoverable account issue (Banned/Bad Pass/etc). Halting.", "FATAL");
+                            isRunning = false;
+                            break;
+                        default:
+                            Log("Unhandled error (" + std::to_string(status) + "). Resetting and retrying.", "WARN");
+                            ResetLoginState();
+                            m_loginAttempted = false;
+                            std::this_thread::sleep_for(std::chrono::seconds(RECONNECT_DELAY));
+                            break;
+                    }
+                    break;
+                }
+                
+                case AUTH_SUCCESS:
+                    Log("Authentication successful. Waiting for realm list...", "INFO");
+                    break;
+
+                case REALM_LIST:
+                    if (!realmSelectAttempted) { // Use the new flag here
+                        m_loginAttempted = false;
+                        Log("Realm list is ready. Selecting realm: '" + targetRealm + "'", "INFO");
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+                        if (!SelectRealm(targetRealm)) {
+                            Log("Failed to select realm. Check realm name.", "FATAL");
+                            isRunning = false;
+                        }
+                        realmSelectAttempted = true; // Prevent spamming SelectRealm
+                    }
+                    break;
+
+                case CHARACTER_SELECT:
+                    Log("Successfully logged in to character select. Monitoring.", "SUCCESS");
+                    m_loginAttempted = false; 
+                    realmSelectAttempted = false;
+                    std::this_thread::sleep_for(std::chrono::seconds(15));
                     break;
             }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
-        Log("Auto-login loop stopped.", false);
+        Log("Auto-login loop stopped.", "INFO");
     }
 
     void Stop() { isRunning = false; }
@@ -415,11 +540,8 @@ public:
 
 private:
     DWORD FindWoWProcess() {
-        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS | TH32CS_SNAPMODULE, 0);
-        if (snapshot == INVALID_HANDLE_VALUE) {
-            Log("CreateToolhelp32Snapshot failed. Error: " + std::to_string(GetLastError()), false);
-            return 0;
-        }
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snapshot == INVALID_HANDLE_VALUE) { return 0; }
         
         PROCESSENTRY32 pe32;
         pe32.dwSize = sizeof(PROCESSENTRY32);
@@ -428,14 +550,12 @@ private:
             do {
                 if (_stricmp(pe32.szExeFile, PROCESS_NAME) == 0) {
                     CloseHandle(snapshot);
-                    Log("Found WoW process: " + std::string(pe32.szExeFile) + " (PID: " + std::to_string(pe32.th32ProcessID) + ")", true);
                     return pe32.th32ProcessID;
                 }
             } while (Process32Next(snapshot, &pe32));
         }
         
         CloseHandle(snapshot);
-        Log("WoW process with name '" + std::string(PROCESS_NAME) + "' not found.");
         return 0;
     }
 };
