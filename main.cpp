@@ -132,6 +132,48 @@ public:
         }
     }
 
+    void LogAllGlobalVariables() {
+        Log("=== Reading All Global Variables ===", "DEBUG");
+        
+        // Read and log all global variables
+        DWORD clientConnectionPtr = ReadMemory<DWORD>(CLIENTCONNECTION_PTR_ADDR);
+        std::stringstream ss;
+        ss << "Read CLIENTCONNECTION_PTR at 0x" << std::hex << CLIENTCONNECTION_PTR_ADDR << " = 0x" << std::hex << clientConnectionPtr;
+        Log(ss.str(), "MEMORY", true);
+        
+        DWORD netClientPtr = ReadMemory<DWORD>(NETCLIENT_PTR_ADDR);
+        ss.str("");
+        ss << "Read NETCLIENT_PTR at 0x" << std::hex << NETCLIENT_PTR_ADDR << " = 0x" << std::hex << netClientPtr;
+        Log(ss.str(), "MEMORY", true);
+        
+        int glueLoginState = ReadMemory<int>(GLUE_LOGIN_STATE_ADDR);
+        ss.str("");
+        ss << "Read GLUE_LOGIN_STATE at 0x" << std::hex << GLUE_LOGIN_STATE_ADDR << " = " << std::dec << glueLoginState;
+        Log(ss.str(), "MEMORY", true);
+        
+        std::string gameStateStr = ReadGlobalString(GAME_STATE_STRING_ADDR, 64);
+        ss.str("");
+        ss << "Read GAME_STATE_STRING at 0x" << std::hex << GAME_STATE_STRING_ADDR << " = '" << gameStateStr << "'";
+        Log(ss.str(), "MEMORY", true);
+        
+        int isWorldLoaded = ReadMemory<int>(IS_WORLD_LOADED_ADDR);
+        ss.str("");
+        ss << "Read IS_WORLD_LOADED at 0x" << std::hex << IS_WORLD_LOADED_ADDR << " = " << std::dec << isWorldLoaded;
+        Log(ss.str(), "MEMORY", true);
+        
+        ClientOperation glueErrorOp = ReadMemory<ClientOperation>(GLUE_ERROR_OPERATION_ADDR);
+        ss.str("");
+        ss << "Read GLUE_ERROR_OPERATION at 0x" << std::hex << GLUE_ERROR_OPERATION_ADDR << " = " << std::dec << glueErrorOp;
+        Log(ss.str(), "MEMORY", true);
+        
+        ConnectionStatus glueErrorStatus = ReadMemory<ConnectionStatus>(GLUE_ERROR_STATUS_ADDR);
+        ss.str("");
+        ss << "Read GLUE_ERROR_STATUS at 0x" << std::hex << GLUE_ERROR_STATUS_ADDR << " = " << std::dec << glueErrorStatus;
+        Log(ss.str(), "MEMORY", true);
+        
+        Log("=== End Global Variables ===", "DEBUG");
+    }
+
     bool AttachToProcess() {
         Log("Attempting to attach to WoW process...", "INFO");
         processId = FindWoWProcess();
@@ -154,9 +196,29 @@ public:
         T value{}; // Initialize to zero
         if (!ReadProcessMemory(processHandle, (LPCVOID)address, &value, sizeof(T), NULL)) {
             std::stringstream ss;
-            ss << "ReadProcessMemory FAILED at address 0x" << std::hex << address << ". Error: " << GetLastError();
+            ss << "Server is down - cannot read memory at address 0x" << std::hex << address;
             Log(ss.str(), "VERBOSE", true);
         }
+        return value;
+    }
+
+    template<typename T>
+    T ReadMemoryWithLog(DWORD address, const std::string& varName) {
+        T value = ReadMemory<T>(address);
+        std::stringstream ss;
+        ss << "Read " << varName << " at 0x" << std::hex << address << " = ";
+        
+        if constexpr (std::is_same_v<T, std::string> || std::is_same_v<T, char*>) {
+            ss << "'" << value << "'";
+        } else if constexpr (std::is_same_v<T, bool>) {
+            ss << (value ? "true" : "false");
+        } else if constexpr (std::is_same_v<T, float>) {
+            ss << std::fixed << std::setprecision(2) << value;
+        } else {
+            ss << std::dec << value << " (0x" << std::hex << value << ")";
+        }
+        
+        Log(ss.str(), "MEMORY", true);
         return value;
     }
 
@@ -283,12 +345,20 @@ public:
     void Run(const std::string& targetRealm) {
         if (!AttachToProcess()) return;
         isRunning = true;
-        Log("Starting main loop. Target realm: '" + targetRealm + "'", "INFO");
+        Log("Starting main loop.", "INFO");
 
         auto actionTimer = std::chrono::steady_clock::now();
         bool realmSelectAttempted = false;
 
         while (isRunning) {
+            // Log all global variables every 10 seconds for debugging
+            static auto lastGlobalVarLog = std::chrono::steady_clock::now();
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - lastGlobalVarLog).count() >= 10) {
+                LogAllGlobalVariables();
+                lastGlobalVarLog = now;
+            }
+            
             ClientState currentState = GetClientState();
             
             if (currentState != lastState) {
@@ -344,7 +414,7 @@ public:
                     {
                         if (!realmSelectAttempted) {
                             m_loginAttempted = false; // We're past the main login part.
-                            Log("Realm list is ready. Selecting realm: '" + targetRealm + "'", "INFO");
+                            Log("Realm list is ready.", "INFO");
                             std::this_thread::sleep_for(std::chrono::milliseconds(1500)); // Small delay for UI to populate
                             // Realm selection removed - no Lua scripting
                             realmSelectAttempted = true;
@@ -400,15 +470,26 @@ WoWAutoLogin* WoWAutoLogin::instance = nullptr;
 
 // Member function definitions outside the class
 ConnectionStatus WoWAutoLogin::GetGlueErrorStatus() {
-    return ReadMemory<ConnectionStatus>(GLUE_ERROR_STATUS_ADDR);
+    ConnectionStatus status = ReadMemory<ConnectionStatus>(GLUE_ERROR_STATUS_ADDR);
+    std::stringstream ss;
+    ss << "Read GLUE_ERROR_STATUS at 0x" << std::hex << GLUE_ERROR_STATUS_ADDR << " = " << std::dec << status;
+    Log(ss.str(), "MEMORY", true);
+    return status;
 }
 
 std::string WoWAutoLogin::ReadGlobalString(DWORD address, size_t maxSize) {
     std::vector<char> buffer(maxSize);
     if (ReadProcessMemory(processHandle, (LPCVOID)address, buffer.data(), maxSize, NULL)) {
         buffer[maxSize - 1] = '\0';
-        return std::string(buffer.data());
+        std::string result = std::string(buffer.data());
+        std::stringstream ss;
+        ss << "Read global string at 0x" << std::hex << address << " = '" << result << "'";
+        Log(ss.str(), "MEMORY", true);
+        return result;
     }
+    std::stringstream ss;
+    ss << "Failed to read global string at 0x" << std::hex << address;
+    Log(ss.str(), "MEMORY", true);
     return "";
 }
 
@@ -420,21 +501,33 @@ ClientState WoWAutoLogin::GetClientState() {
     }
 
     // Priority 2: Check the global s_netClient object, which is the source of truth for the login process.
-    DWORD pNetClient = ReadMemory<DWORD>(NETCLIENT_PTR_ADDR);
+    DWORD pNetClient = ReadMemoryWithLog<DWORD>(NETCLIENT_PTR_ADDR, "NETCLIENT_PTR");
     
 
 
     if (m_loginAttempted && !pNetClient && stateStr == "login") {
         // SCENARIO: We tried to log in, but the s_netClient object failed to even be created.
         // This is a hard "Unable to connect" because the allocation/initialization in ClientServices_Login failed.
+        Log("Server-down detected: pNetClient is NULL", "INFO");
         return ERROR_STATE;
     }
     
-    if (pNetClient) {
+    if (pNetClient) { // Try to read from the pointer regardless
         // Now that we have a valid object, we can read its internal state.
         // CClientConnection inherits from CNetClient, so we can use the same offsets.
         ClientOperation op = ReadMemory<ClientOperation>(pNetClient + CCLIENTCONNECTION_OPERATION_OFFSET);
         ConnectionStatus status = ReadMemory<ConnectionStatus>(pNetClient + CCLIENTCONNECTION_STATUS_OFFSET);
+        
+        // Log the operation and status reads
+        std::stringstream ss;
+        ss << "Read ClientOperation at 0x" << std::hex << (pNetClient + CCLIENTCONNECTION_OPERATION_OFFSET) << " = " << std::dec << op;
+        Log(ss.str(), "MEMORY", true);
+        
+        ss.str("");
+        ss << "Read ConnectionStatus at 0x" << std::hex << (pNetClient + CCLIENTCONNECTION_STATUS_OFFSET) << " = " << std::dec << status;
+        Log(ss.str(), "MEMORY", true);
+
+
 
         if (op == COP_FAILED) {
             // SCENARIO: The object was created, but its operation failed.
@@ -442,20 +535,20 @@ ClientState WoWAutoLogin::GetClientState() {
             return ERROR_STATE;
         }
 
-        // NEW: Detect stuck state where op = 0 (COP_NONE) but we attempted login
-        // This indicates the object was created but never properly initialized
-        if (m_loginAttempted && op == COP_NONE && status > 1000) {
-            // SCENARIO: We tried to log in, the object exists, but it's in an invalid state
-            // with garbage status values. This is the "Unable to connect" failure.
+        // Server down detection: Check for garbage memory values
+        if (m_loginAttempted && (op < -1000000 || op > 1000000)) {
+            Log("Server down detected: Garbage ClientOperation value: " + std::to_string(op), "INFO");
+            return ERROR_STATE;
+        }
+        
+        if (m_loginAttempted && (status < -1000000 || status > 1000000)) {
+            Log("Server down detected: Garbage ConnectionStatus value: " + std::to_string(status), "INFO");
             return ERROR_STATE;
         }
 
-        // NEW: Detect server-down pattern where op is garbage (not a valid enum value)
-        if (m_loginAttempted && op > 1000 && status == 0) {
-            // SCENARIO: Server is down - object gets stuck with garbage op values and status=0
-            Log("Server-down pattern detected: op=" + std::to_string(op) + ", status=" + std::to_string(status), "INFO");
-            return ERROR_STATE;
-        }
+        // REMOVED: This was too aggressive - op=0 with large status is normal during initialization
+
+        // REMOVED: This was also too aggressive - need better detection logic
 
         // Check for specific server-sent authentication errors.
         if (op == COP_AUTHENTICATE && status > AUTH_OK && status != STATUS_NONE) {
@@ -488,16 +581,31 @@ ClientState WoWAutoLogin::GetClientState() {
 ConnectionStatus WoWAutoLogin::GetDetailedErrorStatus() {
     // First, check the global UI error variable. This is often set for dialogs.
     ConnectionStatus glueError = ReadMemory<ConnectionStatus>(GLUE_ERROR_STATUS_ADDR);
+    std::stringstream ss;
+    ss << "Read GLUE_ERROR_STATUS at 0x" << std::hex << GLUE_ERROR_STATUS_ADDR << " = " << std::dec << glueError;
+    Log(ss.str(), "MEMORY", true);
+    
     if (glueError != STATUS_NONE && glueError >= 0) {
         return glueError;
     }
 
     // If that's not set, check the s_netClient object's internal status.
-    DWORD pNetClient = ReadMemory<DWORD>(NETCLIENT_PTR_ADDR);
-    if (pNetClient) {
+    DWORD pNetClient = ReadMemoryWithLog<DWORD>(NETCLIENT_PTR_ADDR, "NETCLIENT_PTR");
+    if (pNetClient) { // Try to read from the pointer regardless
         ClientOperation op = ReadMemory<ClientOperation>(pNetClient + CCLIENTCONNECTION_OPERATION_OFFSET);
+        ConnectionStatus status = ReadMemory<ConnectionStatus>(pNetClient + CCLIENTCONNECTION_STATUS_OFFSET);
+        
+        // Log the operation and status reads
+        std::stringstream ss;
+        ss << "Read ClientOperation at 0x" << std::hex << (pNetClient + CCLIENTCONNECTION_OPERATION_OFFSET) << " = " << std::dec << op;
+        Log(ss.str(), "MEMORY", true);
+        
+        ss.str("");
+        ss << "Read ConnectionStatus at 0x" << std::hex << (pNetClient + CCLIENTCONNECTION_STATUS_OFFSET) << " = " << std::dec << status;
+        Log(ss.str(), "MEMORY", true);
+        
         if (op == COP_FAILED) {
-            return ReadMemory<ConnectionStatus>(pNetClient + CCLIENTCONNECTION_STATUS_OFFSET);
+            return status;
         }
         
         // NEW: Handle the stuck state where op = 0 with garbage status
@@ -558,6 +666,10 @@ int main() {
     
     std::cout << "Enter target realm name: ";
     std::getline(std::cin, realm);
+    
+    // Log credentials to console only (not to file)
+    std::cout << "[CONSOLE] Account: " << account << std::endl;
+    std::cout << "[CONSOLE] Realm: " << realm << std::endl;
     
     if (account.empty() || password.empty() || realm.empty()) {
         std::cout << "Invalid credentials! Account, password, and realm cannot be empty." << std::endl;
