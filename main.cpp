@@ -102,6 +102,7 @@ private:
     std::string password;
     bool isRunning;
     bool m_loginAttempted; // The crucial internal state flag
+    std::chrono::steady_clock::time_point m_loginAttemptTime; // Timestamp of last login attempt
     Logger logger;
     ClientState lastState;
 
@@ -171,6 +172,11 @@ public:
         ss << "Read GLUE_ERROR_STATUS at 0x" << std::hex << GLUE_ERROR_STATUS_ADDR << " = " << std::dec << glueErrorStatus;
         Log(ss.str(), "MEMORY", true);
         
+        int isLoginOperationPending = ReadMemory<int>(GLUE_IS_LOGIN_OPERATION_PENDING_ADDR);
+        ss.str("");
+        ss << "Read GLUE_IS_LOGIN_OPERATION_PENDING at 0x" << std::hex << GLUE_IS_LOGIN_OPERATION_PENDING_ADDR << " = " << std::dec << isLoginOperationPending;
+        Log(ss.str(), "MEMORY", true);
+        
         Log("=== End Global Variables ===", "DEBUG");
     }
 
@@ -220,6 +226,17 @@ public:
         
         Log(ss.str(), "MEMORY", true);
         return value;
+    }
+
+    template<typename T>
+    bool WriteMemory(DWORD address, const T& value) {
+        bool success = WriteProcessMemory(processHandle, (LPVOID)address, &value, sizeof(T), NULL);
+        if (!success) {
+            std::stringstream ss;
+            ss << "Failed to write memory at address 0x" << std::hex << address << " (Error: " << std::dec << GetLastError() << ")";
+            Log(ss.str(), "ERROR", true);
+        }
+        return success;
     }
 
     bool WriteString(DWORD address, const std::string& str) {
@@ -339,6 +356,9 @@ public:
         
         FreeRemoteMemory(remoteAccount);
         FreeRemoteMemory(remotePassword);
+        
+        // Set the login attempt timestamp
+        m_loginAttemptTime = std::chrono::steady_clock::now();
         return success;
     }
 
@@ -494,88 +514,72 @@ std::string WoWAutoLogin::ReadGlobalString(DWORD address, size_t maxSize) {
 }
 
 ClientState WoWAutoLogin::GetClientState() {
-    // Priority 1: Check UI screen string for definitive success.
+    // Priority 1: Check for definitive success states.
     std::string stateStr = ReadGlobalString(GAME_STATE_STRING_ADDR, 64);
     if (stateStr == "charselect" || stateStr == "charcreate") {
         return CHARACTER_SELECT;
     }
 
-    // Priority 2: Check the global s_netClient object, which is the source of truth for the login process.
-    DWORD pNetClient = ReadMemoryWithLog<DWORD>(NETCLIENT_PTR_ADDR, "NETCLIENT_PTR");
-    
-
-
-    if (m_loginAttempted && !pNetClient && stateStr == "login") {
-        // SCENARIO: We tried to log in, but the s_netClient object failed to even be created.
-        // This is a hard "Unable to connect" because the allocation/initialization in ClientServices_Login failed.
-        Log("Server-down detected: pNetClient is NULL", "INFO");
+    // Priority 2: Check for a specific error dialog being shown by the Glue Manager.
+    // This is the most reliable way to detect "Unable to connect", "Disconnected", etc.
+    ClientOperation glueErrorOp = ReadMemory<ClientOperation>(GLUE_ERROR_OPERATION_ADDR);
+    if (glueErrorOp == COP_FAILED) {
+        Log("Detected error state via GLUE_ERROR_OPERATION.", "VERBOSE", true);
         return ERROR_STATE;
     }
+
+    // Priority 3: Check the s_netClient object for in-progress operations.
+    DWORD pNetClient = ReadMemory<DWORD>(NETCLIENT_PTR_ADDR);
     
-    if (pNetClient) { // Try to read from the pointer regardless
-        // Now that we have a valid object, we can read its internal state.
-        // CClientConnection inherits from CNetClient, so we can use the same offsets.
-        ClientOperation op = ReadMemory<ClientOperation>(pNetClient + CCLIENTCONNECTION_OPERATION_OFFSET);
-        ConnectionStatus status = ReadMemory<ConnectionStatus>(pNetClient + CCLIENTCONNECTION_STATUS_OFFSET);
-        
-        // Log the operation and status reads
-        std::stringstream ss;
-        ss << "Read ClientOperation at 0x" << std::hex << (pNetClient + CCLIENTCONNECTION_OPERATION_OFFSET) << " = " << std::dec << op;
-        Log(ss.str(), "MEMORY", true);
-        
-        ss.str("");
-        ss << "Read ConnectionStatus at 0x" << std::hex << (pNetClient + CCLIENTCONNECTION_STATUS_OFFSET) << " = " << std::dec << status;
-        Log(ss.str(), "MEMORY", true);
-
-
-
-        if (op == COP_FAILED) {
-            // SCENARIO: The object was created, but its operation failed.
-            // This is the most common path for "Unable to connect".
-            return ERROR_STATE;
+    // Server down detection: If we can't read the network client pointer or it's invalid
+    if (!pNetClient || pNetClient < 0x1000000 || pNetClient > 0x7FFFFFFF) {
+        if (m_loginAttempted) {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_loginAttemptTime).count();
+            
+            if (elapsed > 3000) { // Wait 3 seconds before declaring server down
+                Log("Server down detected: Invalid NETCLIENT_PTR (0x" + std::to_string(pNetClient) + ") after " + std::to_string(elapsed) + "ms", "INFO");
+                return ERROR_STATE;
+            } else {
+                Log("Ignoring invalid NETCLIENT_PTR: 0x" + std::to_string(pNetClient) + " (only " + std::to_string(elapsed) + "ms since login)", "VERBOSE", true);
+            }
         }
-
-        // Server down detection: Check for garbage memory values
-        if (m_loginAttempted && (op < -1000000 || op > 1000000)) {
-            Log("Server down detected: Garbage ClientOperation value: " + std::to_string(op), "INFO");
-            return ERROR_STATE;
-        }
-        
-        if (m_loginAttempted && (status < -1000000 || status > 1000000)) {
-            Log("Server down detected: Garbage ConnectionStatus value: " + std::to_string(status), "INFO");
-            return ERROR_STATE;
-        }
-
-        // REMOVED: This was too aggressive - op=0 with large status is normal during initialization
-
-        // REMOVED: This was also too aggressive - need better detection logic
-
-        // Check for specific server-sent authentication errors.
-        if (op == COP_AUTHENTICATE && status > AUTH_OK && status != STATUS_NONE) {
-            return ERROR_STATE;
-        }
-
-        // Check for normal progress states.
-        switch (op) {
-            case COP_CONNECT:
-            case COP_HANDSHAKE:
-            case COP_AUTHENTICATE:
-                return CONNECTING_TO_AUTH;
-            case COP_AUTHENTICATED:
-                return AUTH_SUCCESS;
-            case COP_GET_REALMS:
-                return REALM_LIST;
-            case COP_LOGIN_CHARACTER:
-                return CONNECTING_TO_REALM;
-        }
+        return AT_LOGIN_SCREEN; // Can't determine state, assume login screen
     }
     
-    // Fallback: If we're on the login screen and haven't detected another state, we're idle.
-    if (stateStr == "login") {
-        return AT_LOGIN_SCREEN;
+    // Try to read the operation and status
+    ClientOperation op = ReadMemory<ClientOperation>(pNetClient + CCLIENTCONNECTION_OPERATION_OFFSET);
+    ConnectionStatus status = ReadMemory<ConnectionStatus>(pNetClient + CCLIENTCONNECTION_STATUS_OFFSET);
+
+    // Server down detection: Check for garbage memory values ONLY if a login was attempted.
+    if (m_loginAttempted && (op < 0 || op > 100)) { // A more reasonable range check.
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_loginAttemptTime).count();
+        
+        if (elapsed > 3000) { // Wait 3 seconds before declaring server down
+            Log("Server down detected: Garbage ClientOperation value: " + std::to_string(op) + " after " + std::to_string(elapsed) + "ms", "INFO");
+            return ERROR_STATE;
+        } else {
+            Log("Ignoring garbage ClientOperation value: " + std::to_string(op) + " (only " + std::to_string(elapsed) + "ms since login)", "VERBOSE", true);
+        }
     }
 
-    return AT_LOGIN_SCREEN; // Default return
+    // Check for normal progress states.
+    switch (op) {
+        case COP_CONNECT:
+        case COP_HANDSHAKE:
+        case COP_AUTHENTICATE:
+            return CONNECTING_TO_AUTH;
+        case COP_AUTHENTICATED:
+            return AUTH_SUCCESS;
+        case COP_GET_REALMS:
+            return REALM_LIST;
+        case COP_LOGIN_CHARACTER:
+            return CONNECTING_TO_REALM;
+    }
+    
+    // Fallback: If nothing else is detected, we are at the login screen.
+    return AT_LOGIN_SCREEN;
 }
 
 ConnectionStatus WoWAutoLogin::GetDetailedErrorStatus() {
@@ -634,7 +638,60 @@ ConnectionStatus WoWAutoLogin::GetDetailedErrorStatus() {
 
 void WoWAutoLogin::ResetLoginState() {
     Log("Calling reset function to dismiss dialog and clear state...", "ACTION");
+
+    // --- STEP 1: Clean up the C++ and Network Backend ---
+    Log("Forcing g_LoginState to 1 for backend cleanup.", "VERBOSE", true);
+    if (!WriteMemory<int>(GLUE_LOGIN_STATE_ADDR, 1)) {
+        Log("Failed to write to g_LoginState, cancellation may fail.", "ERROR");
+    }
+    // Call the original cancel function. We don't need to wait for it.
     CallCdeclFunction(RESET_LOGIN_STATE_FUNC, {});
+    std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Give it a moment to start.
+
+    // --- STEP 2: Force the Lua UI to Reset ---
+    Log("Forcing UI reset by signaling SET_GLUE_SCREEN event.", "VERBOSE", true);
+    
+    // We need to pass the string "login" to the function.
+    // To do this, we must allocate memory for it inside the WoW process.
+    const char* screenName = "login";
+    DWORD remoteStringAddr = AllocateRemoteMemory(strlen(screenName) + 1);
+    if (!remoteStringAddr) {
+        Log("Failed to allocate memory for screen name string.", "ERROR");
+        m_loginAttempted = false;
+        return;
+    }
+
+    if (!WriteString(remoteStringAddr, screenName)) {
+        Log("Failed to write screen name string to remote memory.", "ERROR");
+        FreeRemoteMemory(remoteStringAddr);
+        m_loginAttempted = false;
+        return;
+    } else {
+        Log("Successfully wrote 'login' string to remote memory at 0x" + std::to_string(remoteStringAddr), "VERBOSE", true);
+    }
+
+    // Now, call FrameScript_SignalEvent(0, "%s", remoteStringAddr)
+    // Event 0 = "SET_GLUE_SCREEN"
+    // %s = format specifier
+    // remoteStringAddr = pointer to our "login" string
+    DWORD formatStringAddr = FORMAT_STRING_S_ADDR; // Use the definition from config.h
+    Log("Calling FrameScript_SignalEvent(0, 0x" + std::to_string(formatStringAddr) + ", 0x" + std::to_string(remoteStringAddr) + ")", "VERBOSE", true);
+    
+    bool success = CallCdeclFunction(FRAME_SCRIPT_SIGNAL_EVENT_FUNC, { 0, formatStringAddr, remoteStringAddr });
+    if (!success) {
+        Log("Call to FrameScript_SignalEvent FAILED.", "ERROR");
+    } else {
+        Log("Call to FrameScript_SignalEvent SUCCESSFUL.", "VERBOSE", true);
+    }
+
+    // Clean up the memory we allocated.
+    FreeRemoteMemory(remoteStringAddr);
+    
+    // Give the UI a brief moment to execute the screen change.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    
+    // Now, we can safely allow a new login attempt.
+    m_loginAttempted = false;
 }
 
 // Ctrl+C handler function

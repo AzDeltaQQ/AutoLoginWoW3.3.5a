@@ -7,16 +7,21 @@
 
 // --- Core Game Functions ---
 #define PROCESS_SERVER_LOGIN_FUNC       0x4D8A30 // Lua: DefaultServerLogin(account, password)
-#define RESET_LOGIN_STATE_FUNC          0x004DE4B0 // Equivalent to clicking "Cancel" on any login/realm dialog.
+#define RESET_LOGIN_STATE_FUNC          0x4D98D0  // Equivalent to clicking "Cancel" on any login/realm dialog.
+#define FRAME_SCRIPT_SIGNAL_EVENT_FUNC  0x81B530 // The C++ -> Lua event dispatcher
 
 // --- Global Pointers & State Variables ---
 #define CLIENTCONNECTION_PTR_ADDR       0xC79CE0 // CClientConnection**
 #define NETCLIENT_PTR_ADDR              0xC79CEC // CNetClient** (Note: CClientConnection inherits from this)
-#define GLUE_LOGIN_STATE_ADDR           0xB6AFA0 // The g_LoginState enum (int)
+#define GLUE_LOGIN_STATE_ADDR           0xB6AA38 // The g_LoginState enum (int)
+#define GLUE_IS_LOGIN_OPERATION_PENDING_ADDR 0xB6AFA0 // g_isLoginOperationPending (likely adjacent to g_LoginState)
 #define GAME_STATE_STRING_ADDR          0xB6A9E0 // The current UI screen (char*) e.g., "login", "charselect"
 #define IS_WORLD_LOADED_ADDR            0xBEBA40 // Set to 1 when in the 3D world (int)
 #define GLUE_ERROR_OPERATION_ADDR       0xAC3DA4 // Stores the ClientOperation code of the last error.
 #define GLUE_ERROR_STATUS_ADDR          0xAC3DA0 // Stores the ConnectionStatus code of the last error.
+
+// --- Static Data Addresses ---
+#define FORMAT_STRING_S_ADDR            0x9E0E50 // Correct address for the "%s" format string
 
 // --- Object Offsets ---
 // CNetClient offsets (within CClientConnection)
@@ -32,7 +37,7 @@
 #define CCLIENTCONNECTION_STATUS_OFFSET     0x2F50
 
 // --- Program Settings ---
-#define PROCESS_NAME                    "Project-Epoch.exe"
+#define PROCESS_NAME                    "WowExt.exe"
 #define FUNCTION_CALL_TIMEOUT           5000      // Milliseconds
 #define DEBUG_OUTPUT                    1
 #define VERBOSE_LOGGING                 1
