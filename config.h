@@ -32,7 +32,7 @@
 #define CCLIENTCONNECTION_STATUS_OFFSET     0x2F50
 
 // --- Program Settings ---
-#define PROCESS_NAME                    "Project-Epoch.exe" // Disregarding Wow.exe change, keeping WowExt.exe
+#define PROCESS_NAME                    "Project-Epoch.exe"
 #define FUNCTION_CALL_TIMEOUT           5000      // Milliseconds
 #define DEBUG_OUTPUT                    1
 #define VERBOSE_LOGGING                 1
@@ -51,7 +51,7 @@ enum ClientOperation {
     COP_AUTHENTICATE = 4,
     COP_FAILED = 5,
     COP_DOWNLOADFILE = 6,
-    COP_GET_CHARACTERS = 7,     // Note: Your initial enum was slightly off.
+    COP_GET_CHARACTERS = 7, 
     COP_LOGIN_CHARACTER = 8,
     COP_GET_REALMS = 9,
     COP_AUTHENTICATED = 10,
