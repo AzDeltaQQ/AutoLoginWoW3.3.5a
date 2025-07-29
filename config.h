@@ -57,7 +57,7 @@ enum ClientOperation {
     COP_AUTHENTICATE = 4,
     COP_FAILED = 5,
     COP_DOWNLOADFILE = 6,
-    COP_GET_CHARACTERS = 7,     // Note: Your initial enum was slightly off.
+    COP_GET_CHARACTERS = 7, 
     COP_LOGIN_CHARACTER = 8,
     COP_GET_REALMS = 9,
     COP_AUTHENTICATED = 10,
