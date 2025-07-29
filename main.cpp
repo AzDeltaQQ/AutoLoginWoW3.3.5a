@@ -421,6 +421,8 @@ ClientState WoWAutoLogin::GetClientState() {
 
     // Priority 2: Check the global s_netClient object, which is the source of truth for the login process.
     DWORD pNetClient = ReadMemory<DWORD>(NETCLIENT_PTR_ADDR);
+    
+
 
     if (m_loginAttempted && !pNetClient && stateStr == "login") {
         // SCENARIO: We tried to log in, but the s_netClient object failed to even be created.
@@ -448,9 +450,10 @@ ClientState WoWAutoLogin::GetClientState() {
             return ERROR_STATE;
         }
 
-        // NEW: Detect server-down pattern where op = 1416 with garbage status
-        if (m_loginAttempted && op == 1416 && status > 1000000) {
-            // SCENARIO: Server is down - object gets stuck with op = 1416 and large status values
+        // NEW: Detect server-down pattern where op is garbage (not a valid enum value)
+        if (m_loginAttempted && op > 1000 && status == 0) {
+            // SCENARIO: Server is down - object gets stuck with garbage op values and status=0
+            Log("Server-down pattern detected: op=" + std::to_string(op) + ", status=" + std::to_string(status), "INFO");
             return ERROR_STATE;
         }
 
@@ -502,6 +505,15 @@ ConnectionStatus WoWAutoLogin::GetDetailedErrorStatus() {
             ConnectionStatus status = ReadMemory<ConnectionStatus>(pNetClient + CCLIENTCONNECTION_STATUS_OFFSET);
             if (status > 1000) {
                 // This is the "Unable to connect" failure pattern
+                return RESPONSE_FAILED_TO_CONNECT;
+            }
+        }
+        
+        // NEW: Handle the server-down pattern where op is garbage
+        if (op > 1000) {
+            ConnectionStatus status = ReadMemory<ConnectionStatus>(pNetClient + CCLIENTCONNECTION_STATUS_OFFSET);
+            if (status == 0) {
+                // This is the server-down failure pattern
                 return RESPONSE_FAILED_TO_CONNECT;
             }
         }

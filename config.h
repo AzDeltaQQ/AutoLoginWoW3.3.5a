@@ -7,7 +7,7 @@
 
 // --- Core Game Functions ---
 #define PROCESS_SERVER_LOGIN_FUNC       0x4D8A30 // Lua: DefaultServerLogin(account, password)
-#define RESET_LOGIN_STATE_FUNC          0x4DA9D0 // Equivalent to clicking "Cancel" on any login/realm dialog.
+#define RESET_LOGIN_STATE_FUNC          0x004DE4B0 // Equivalent to clicking "Cancel" on any login/realm dialog.
 
 // --- Global Pointers & State Variables ---
 #define CLIENTCONNECTION_PTR_ADDR       0xC79CE0 // CClientConnection**
