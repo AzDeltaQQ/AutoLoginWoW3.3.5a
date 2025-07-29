@@ -14,7 +14,7 @@
 // --- Global Pointers & State Variables ---
 #define CLIENTCONNECTION_PTR_ADDR       0xC79CE0 // CClientConnection**
 #define NETCLIENT_PTR_ADDR              0xC79CEC // CNetClient** (Note: CClientConnection inherits from this)
-#define GLUE_STATE_ADDR                 0xB6AFA0 // Replaces LOGIN_STATE_ADDR
+#define GLUE_LOGIN_STATE_ADDR           0xB6AFA0 // The g_LoginState enum (int)
 #define GAME_STATE_STRING_ADDR          0xB6A9E0 // The current UI screen (char*) e.g., "login", "charselect"
 #define IS_WORLD_LOADED_ADDR            0xBEBA40 // Set to 1 when in the 3D world (int)
 #define GLUE_ERROR_OPERATION_ADDR       0xAC3DA4 // Stores the ClientOperation code of the last error.
@@ -41,6 +41,11 @@
 
 // --- Memory Protection ---
 #define MEMORY_PROTECTION               PAGE_EXECUTE_READWRITE
+
+// --- Auto-Login Specific Memory ---
+// We will allocate this memory ourselves. Start with a placeholder.
+#define LAST_LOGIN_STATE_CODE_ADDR      0x0
+#define HANDLE_LOGIN_STATE_CHANGE_FUNC  0x8C53B0 // From analysis
 
 // Represents the current high-level operation the client is performing.
 // Derived from the string array at 0xAB95F0
