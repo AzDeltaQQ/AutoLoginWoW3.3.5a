@@ -104,8 +104,6 @@ private:
     bool m_loginAttempted; // The crucial internal state flag
     Logger logger;
     ClientState lastState;
-    DWORD lastLoginStateCodeAddr; // Will hold the allocated address
-    BYTE originalBytes[5];        // To store the original code for unhooking
 
 public:
     static WoWAutoLogin* instance;
@@ -114,23 +112,18 @@ public:
     ConnectionStatus GetGlueErrorStatus();
     std::string ReadGlobalString(DWORD address, size_t maxSize);
     ClientState GetClientState();
+    ConnectionStatus GetDetailedErrorStatus();
     void ResetLoginState();
-    bool HookLoginStateChange();
-    bool UnhookLoginStateChange();
-    int GetLastLoginStateCode();
 
     WoWAutoLogin(const std::string& account, const std::string& pass)
         : accountName(account), password(pass), isRunning(false), m_loginAttempted(false), lastState((ClientState)-1) {
         processHandle = NULL;
         processId = 0;
-        lastLoginStateCodeAddr = 0;
-        memset(originalBytes, 0, sizeof(originalBytes));
     }
 
     ~WoWAutoLogin() {
         if (processHandle) CloseHandle(processHandle);
         if (instance == this) instance = nullptr;
-        UnhookLoginStateChange(); // Ensure unhooking on destruction
     }
 
     void Log(const std::string& message, const std::string& level = "INFO", bool verbose = false) {
@@ -287,52 +280,10 @@ public:
         return success;
     }
 
-    bool SelectRealm(const std::string& realmName) {
-        DWORD pNetClient = ReadMemory<DWORD>(NETCLIENT_PTR_ADDR);
-        if (!pNetClient) return false;
-        
-        int realmCount = ReadMemory<int>(pNetClient + REALM_COUNT_OFFSET);
-        if (realmCount <= 0) {
-             Log("Realm count is zero or invalid.", "WARN");
-             return false;
-        }
-
-        DWORD realmArray = ReadMemory<DWORD>(pNetClient + REALM_LIST_PTR_OFFSET);
-        for (int i = 0; i < realmCount; i++) {
-            char currentRealmName[64] = {0};
-            DWORD realmEntryAddr = realmArray + (i * REALM_STRUCT_SIZE);
-            ReadProcessMemory(processHandle, (LPCVOID)(realmEntryAddr + REALM_NAME_OFFSET), currentRealmName, sizeof(currentRealmName)-1, NULL);
-
-            if (_stricmp(currentRealmName, realmName.c_str()) == 0) {
-                Log("Found realm '" + realmName + "'. Selecting via FrameScript_Execute...", "ACTION");
-                std::string luaScript = "SelectRealm(" + std::to_string(i + 1) + ")";
-                
-                DWORD remoteScript = AllocateRemoteMemory(luaScript.length() + 1);
-                DWORD remoteSourceName = AllocateRemoteMemory(16);
-                if (!remoteScript || !remoteSourceName) return false;
-
-                WriteString(remoteScript, luaScript);
-                WriteString(remoteSourceName, "AutoLogin");
-                bool success = CallCdeclFunction(FRAMESCRIPT_EXECUTE_FUNC, { remoteScript, remoteSourceName, 0 });
-                
-                FreeRemoteMemory(remoteScript);
-                FreeRemoteMemory(remoteSourceName);
-                return success;
-            }
-        }
-        Log("Could not find realm: '" + realmName + "'", "ERROR");
-        return false;
-    }
-    
     void Run(const std::string& targetRealm) {
         if (!AttachToProcess()) return;
         isRunning = true;
         Log("Starting main loop. Target realm: '" + targetRealm + "'", "INFO");
-
-        // --- Hook HandleLoginStateChange here ---
-        if (!HookLoginStateChange()) {
-            Log("Failed to hook HandleLoginStateChange. Continuing without hook logging.", "WARN");
-        }
 
         auto actionTimer = std::chrono::steady_clock::now();
         bool realmSelectAttempted = false;
@@ -340,18 +291,10 @@ public:
         while (isRunning) {
             ClientState currentState = GetClientState();
             
-            // --- Log hooked state change if available ---
-            int lastLoginCode = GetLastLoginStateCode();
-            if (lastLoginCode != -1) {
-                Log("Hook captured HandleLoginStateChange with code: " + std::to_string(lastLoginCode), "DEBUG");
-                // Optionally, clear the stored code after reading if you only want to log new events
-                // WriteProcessMemory(processHandle, (LPVOID)lastLoginStateCodeAddr, 0, sizeof(DWORD), NULL);
-            }
-            
             if (currentState != lastState) {
                 Log("State changed to: " + StateToString(currentState), "STATE");
                 lastState = currentState;
-                actionTimer = std::chrono::steady_clock::now(); // Reset timer on any state change
+                actionTimer = std::chrono::steady_clock::now();
             }
 
             switch (currentState) {
@@ -383,39 +326,12 @@ public:
                     break;
 
                 case ERROR_STATE: {
-                    ConnectionStatus status = GetGlueErrorStatus();
-                    Log("Detected error state with ConnectionStatus: " + std::to_string(status), "ERROR");
+                    // Server is down - detected by stuck s_netClient state
+                    Log("Server is down. Retrying in " + std::to_string(RECONNECT_DELAY) + "s.", "WARN");
                     
-                    // First, dismiss the dialog. This also clears the global error variables.
-                    // Your GlueMgr_HandleDisconnect (0x4DA9D0) is the correct function for this.
-                    ResetLoginState();
-
-                    // Now, handle the error code we captured BEFORE resetting.
-                    switch (status) {
-                        case RESPONSE_FAILED_TO_CONNECT:
-                        case RESPONSE_DISCONNECTED:
-                        case AUTH_LOGIN_SERVER_NOT_FOUND:
-                            Log("Error: Server seems to be down. Retrying in " + std::to_string(RECONNECT_DELAY) + "s.", "WARN");
-                            std::this_thread::sleep_for(std::chrono::seconds(RECONNECT_DELAY));
-                            // Allow a new login attempt by resetting the flag.
-                            m_loginAttempted = false; 
-                            break;
-
-                        case AUTH_INCORRECT_PASSWORD:
-                        case AUTH_UNKNOWN_ACCOUNT:
-                        case AUTH_BANNED:
-                        case AUTH_SUSPENDED:
-                            Log("Error: Unrecoverable account issue (Banned/Bad Pass/etc). Halting.", "FATAL");
-                            isRunning = false;
-                            break;
-                            
-                        default:
-                            Log("Unhandled error (" + std::to_string(status) + "). Resetting and retrying after delay.", "WARN");
-                            std::this_thread::sleep_for(std::chrono::seconds(RECONNECT_DELAY));
-                            m_loginAttempted = false;
-                            break;
-                    }
-                    // Break to allow the main loop to re-evaluate the (now reset) state immediately.
+                    ResetLoginState(); // Dismiss any error dialogs
+                    std::this_thread::sleep_for(std::chrono::seconds(RECONNECT_DELAY));
+                    m_loginAttempted = false; // Allow a new attempt
                     break;
                 }
                 
@@ -430,10 +346,7 @@ public:
                             m_loginAttempted = false; // We're past the main login part.
                             Log("Realm list is ready. Selecting realm: '" + targetRealm + "'", "INFO");
                             std::this_thread::sleep_for(std::chrono::milliseconds(1500)); // Small delay for UI to populate
-                            if (!SelectRealm(targetRealm)) {
-                                Log("Failed to select realm. Check realm name.", "FATAL");
-                                isRunning = false;
-                            }
+                            // Realm selection removed - no Lua scripting
                             realmSelectAttempted = true;
                         }
                     }
@@ -452,8 +365,7 @@ public:
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
         Log("Auto-login loop stopped.", "INFO");
-        UnhookLoginStateChange(); // Cleanup
-    }
+}
 
     void Stop() { isRunning = false; }
     
@@ -501,166 +413,108 @@ std::string WoWAutoLogin::ReadGlobalString(DWORD address, size_t maxSize) {
 }
 
 ClientState WoWAutoLogin::GetClientState() {
-    // Priority 1: Check for definitive success states using the UI state string.
+    // Priority 1: Check UI screen string for definitive success.
     std::string stateStr = ReadGlobalString(GAME_STATE_STRING_ADDR, 64);
     if (stateStr == "charselect" || stateStr == "charcreate") {
         return CHARACTER_SELECT;
     }
 
-    // Priority 2: Check for a "fast fail" error. This is the crucial fix.
-    // This state occurs when we are on the login screen AND we have attempted a login.
-    // In this case, the global error status is the most reliable source of truth.
-    if (stateStr == "login" && m_loginAttempted) {
-        ConnectionStatus errorStatus = ReadMemory<ConnectionStatus>(GLUE_ERROR_STATUS_ADDR);
-        if (errorStatus == RESPONSE_FAILED_TO_CONNECT || errorStatus == AUTH_LOGIN_SERVER_NOT_FOUND) {
+    // Priority 2: Check the global s_netClient object, which is the source of truth for the login process.
+    DWORD pNetClient = ReadMemory<DWORD>(NETCLIENT_PTR_ADDR);
+
+    if (m_loginAttempted && !pNetClient && stateStr == "login") {
+        // SCENARIO: We tried to log in, but the s_netClient object failed to even be created.
+        // This is a hard "Unable to connect" because the allocation/initialization in ClientServices_Login failed.
+        return ERROR_STATE;
+    }
+    
+    if (pNetClient) {
+        // Now that we have a valid object, we can read its internal state.
+        // CClientConnection inherits from CNetClient, so we can use the same offsets.
+        ClientOperation op = ReadMemory<ClientOperation>(pNetClient + CCLIENTCONNECTION_OPERATION_OFFSET);
+        ConnectionStatus status = ReadMemory<ConnectionStatus>(pNetClient + CCLIENTCONNECTION_STATUS_OFFSET);
+
+        if (op == COP_FAILED) {
+            // SCENARIO: The object was created, but its operation failed.
+            // This is the most common path for "Unable to connect".
             return ERROR_STATE;
         }
-    }
 
-    // Priority 3: Check the native CClientConnection object for in-progress or other error states.
-    DWORD pClientConnection = ReadMemory<DWORD>(CLIENTCONNECTION_PTR_ADDR);
-    if (pClientConnection && pClientConnection != 0xFFFFFFFF) {
-        ClientOperation op = ReadMemory<ClientOperation>(pClientConnection + CCLIENTCONNECTION_OPERATION_OFFSET);
-        
-        if (op == COP_FAILED) return ERROR_STATE;
+        // NEW: Detect stuck state where op = 0 (COP_NONE) but we attempted login
+        // This indicates the object was created but never properly initialized
+        if (m_loginAttempted && op == COP_NONE && status > 1000) {
+            // SCENARIO: We tried to log in, the object exists, but it's in an invalid state
+            // with garbage status values. This is the "Unable to connect" failure.
+            return ERROR_STATE;
+        }
 
-        ConnectionStatus status = ReadMemory<ConnectionStatus>(pClientConnection + CCLIENTCONNECTION_STATUS_OFFSET);
-        
-        // Any authentication error is an immediate error state.
+        // NEW: Detect server-down pattern where op = 1416 with garbage status
+        if (m_loginAttempted && op == 1416 && status > 1000000) {
+            // SCENARIO: Server is down - object gets stuck with op = 1416 and large status values
+            return ERROR_STATE;
+        }
+
+        // Check for specific server-sent authentication errors.
         if (op == COP_AUTHENTICATE && status > AUTH_OK && status != STATUS_NONE) {
             return ERROR_STATE;
         }
-        
+
+        // Check for normal progress states.
         switch (op) {
             case COP_CONNECT:
             case COP_HANDSHAKE:
-                return CONNECTING_TO_AUTH;
             case COP_AUTHENTICATE:
-                if (status == AUTH_OK) return AUTH_SUCCESS;
-                return CONNECTING_TO_AUTH; // Still in the process
+                return CONNECTING_TO_AUTH;
+            case COP_AUTHENTICATED:
+                return AUTH_SUCCESS;
             case COP_GET_REALMS:
-                if (status == REALM_LIST_SUCCESS) return REALM_LIST;
-                return AUTH_SUCCESS; // Still downloading list
+                return REALM_LIST;
             case COP_LOGIN_CHARACTER:
                 return CONNECTING_TO_REALM;
         }
     }
-
-    // Priority 4: If all else fails and we are on the login screen, we are idle.
+    
+    // Fallback: If we're on the login screen and haven't detected another state, we're idle.
     if (stateStr == "login") {
         return AT_LOGIN_SCREEN;
     }
-    
-    // Fallback for any other unknown state.
-    return AT_LOGIN_SCREEN;
+
+    return AT_LOGIN_SCREEN; // Default return
+}
+
+ConnectionStatus WoWAutoLogin::GetDetailedErrorStatus() {
+    // First, check the global UI error variable. This is often set for dialogs.
+    ConnectionStatus glueError = ReadMemory<ConnectionStatus>(GLUE_ERROR_STATUS_ADDR);
+    if (glueError != STATUS_NONE && glueError >= 0) {
+        return glueError;
+    }
+
+    // If that's not set, check the s_netClient object's internal status.
+    DWORD pNetClient = ReadMemory<DWORD>(NETCLIENT_PTR_ADDR);
+    if (pNetClient) {
+        ClientOperation op = ReadMemory<ClientOperation>(pNetClient + CCLIENTCONNECTION_OPERATION_OFFSET);
+        if (op == COP_FAILED) {
+            return ReadMemory<ConnectionStatus>(pNetClient + CCLIENTCONNECTION_STATUS_OFFSET);
+        }
+        
+        // NEW: Handle the stuck state where op = 0 with garbage status
+        if (op == COP_NONE) {
+            ConnectionStatus status = ReadMemory<ConnectionStatus>(pNetClient + CCLIENTCONNECTION_STATUS_OFFSET);
+            if (status > 1000) {
+                // This is the "Unable to connect" failure pattern
+                return RESPONSE_FAILED_TO_CONNECT;
+            }
+        }
+    }
+
+    // If we are in an error state but have no code, it's the inferred "stuck" state.
+    // Default to a generic connection failure.
+    return RESPONSE_FAILED_TO_CONNECT;
 }
 
 void WoWAutoLogin::ResetLoginState() {
     Log("Calling reset function to dismiss dialog and clear state...", "ACTION");
     CallCdeclFunction(RESET_LOGIN_STATE_FUNC, {});
-}
-
-bool WoWAutoLogin::HookLoginStateChange() {
-    // Step 1: Allocate memory to store the result code.
-    lastLoginStateCodeAddr = AllocateRemoteMemory(sizeof(DWORD));
-    if (!lastLoginStateCodeAddr) {
-        Log("Failed to allocate memory for code storage.", "ERROR");
-        return false;
-    }
-    // Initialize it to -1 (or some other invalid code)
-    int initialCode = -1;
-    WriteProcessMemory(processHandle, (LPVOID)lastLoginStateCodeAddr, &initialCode, sizeof(int), NULL);
-
-    Log("Allocated code storage at 0x" + std::to_string(lastLoginStateCodeAddr), "INFO");
-
-    // Step 2: Read the original bytes from the target function for restoration later.
-    if (!ReadProcessMemory(processHandle, (LPCVOID)HANDLE_LOGIN_STATE_CHANGE_FUNC, originalBytes, 5, NULL)) {
-        Log("Failed to read original bytes of HandleLoginStateChange.", "ERROR");
-        return false;
-    }
-
-    // Assembly stub logic:
-    //   mov eax, [esp+8]      ; Get the *second* argument (the login code). esp+4 is the 'this' ptr.
-    //   mov [lastLoginStateCodeAddr], eax ; Store it in our allocated memory
-    //   push ebp              ; Original instruction 1 (0x55)
-    //   mov ebp, esp          ; Original instruction 2 (0x8B 0xEC)
-    //   jmp back_to_original  ; Jump back to the rest of the function
-
-    std::vector<BYTE> stub = {
-        0x8B, 0x44, 0x24, 0x08,             // mov eax, [esp+8] (Corrected to get the int code, not the 'this' ptr)
-        0xA3, 0x00, 0x00, 0x00, 0x00,       // mov [lastLoginStateCodeAddr], eax - Will patch this
-        0x55,                               // push ebp (Original instruction 1)
-        0x8B, 0xEC,                         // mov ebp, esp (Original instruction 2)
-        0xE9, 0x00, 0x00, 0x00, 0x00        // jmp back_to_original - Will patch this
-    };
-
-    // Patch the address where we will store the code
-    memcpy(&stub[5], &lastLoginStateCodeAddr, 4);
-
-    // Allocate memory for the stub *before* calculating the relative jump
-    DWORD stubAddr = AllocateRemoteMemory(stub.size());
-    if (!stubAddr) {
-        Log("Failed to allocate memory for the hook stub.", "ERROR");
-        return false;
-    }
-
-    // Calculate the relative address for the jump back
-    DWORD jmpBackAddr = HANDLE_LOGIN_STATE_CHANGE_FUNC + 5;
-    DWORD relativeJmpBack = jmpBackAddr - (stubAddr + stub.size());
-    memcpy(&stub[14], &relativeJmpBack, 4);
-
-    // Write the NOW-PATCHED stub to memory
-    if (!WriteProcessMemory(processHandle, (LPVOID)stubAddr, stub.data(), stub.size(), NULL)) {
-        Log("Failed to write stub to memory.", "ERROR");
-        FreeRemoteMemory(stubAddr);
-        return false;
-    }
-    
-    // Overwrite the original function with a jump to our stub
-    BYTE jmpPatch[5] = { 0xE9, 0x00, 0x00, 0x00, 0x00 };
-    DWORD relativeAddr = stubAddr - (HANDLE_LOGIN_STATE_CHANGE_FUNC + 5);
-    memcpy(&jmpPatch[1], &relativeAddr, 4);
-    
-    DWORD oldProtect;
-    VirtualProtectEx(processHandle, (LPVOID)HANDLE_LOGIN_STATE_CHANGE_FUNC, 5, PAGE_EXECUTE_READWRITE, &oldProtect);
-    bool success = WriteProcessMemory(processHandle, (LPVOID)HANDLE_LOGIN_STATE_CHANGE_FUNC, jmpPatch, 5, NULL);
-    VirtualProtectEx(processHandle, (LPVOID)HANDLE_LOGIN_STATE_CHANGE_FUNC, 5, oldProtect, &oldProtect);
-
-    if (success) {
-        Log("Successfully hooked HandleLoginStateChange.", "SUCCESS");
-    } else {
-        Log("Failed to write JMP patch to HandleLoginStateChange.", "ERROR");
-    }
-    return success;
-}
-
-bool WoWAutoLogin::UnhookLoginStateChange() {
-    if (originalBytes[0] == 0) return true; // Nothing to unhook
-
-    DWORD oldProtect;
-    VirtualProtectEx(processHandle, (LPVOID)HANDLE_LOGIN_STATE_CHANGE_FUNC, 5, PAGE_EXECUTE_READWRITE, &oldProtect);
-    bool success = WriteProcessMemory(processHandle, (LPVOID)HANDLE_LOGIN_STATE_CHANGE_FUNC, originalBytes, 5, NULL);
-    VirtualProtectEx(processHandle, (LPVOID)HANDLE_LOGIN_STATE_CHANGE_FUNC, 5, oldProtect, &oldProtect);
-    
-    if (lastLoginStateCodeAddr) {
-        FreeRemoteMemory(lastLoginStateCodeAddr);
-        lastLoginStateCodeAddr = 0;
-    }
-    Log("Unhooked HandleLoginStateChange.", "INFO");
-    return success;
-}
-
-int WoWAutoLogin::GetLastLoginStateCode() {
-    if (!lastLoginStateCodeAddr) return -1; // Not hooked
-    
-    int code = ReadMemory<int>(lastLoginStateCodeAddr);
-    
-    // If we read a valid code, reset it so we don't log it again.
-    if (code != -1) {
-        int resetValue = -1;
-        WriteProcessMemory(processHandle, (LPVOID)lastLoginStateCodeAddr, &resetValue, sizeof(int), NULL);
-    }
-    return code;
 }
 
 // Ctrl+C handler function

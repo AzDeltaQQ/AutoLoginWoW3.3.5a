@@ -7,8 +7,6 @@
 
 // --- Core Game Functions ---
 #define PROCESS_SERVER_LOGIN_FUNC       0x4D8A30 // Lua: DefaultServerLogin(account, password)
-#define FRAMESCRIPT_EXECUTE_FUNC        0x819210 // Lua: RunScript(code)
-#define FRAMESCRIPT_GETTEXT_FUNC        0x819D40 // Gets a string result from a Lua script
 #define RESET_LOGIN_STATE_FUNC          0x4DA9D0 // Equivalent to clicking "Cancel" on any login/realm dialog.
 
 // --- Global Pointers & State Variables ---
@@ -42,10 +40,6 @@
 // --- Memory Protection ---
 #define MEMORY_PROTECTION               PAGE_EXECUTE_READWRITE
 
-// --- Auto-Login Specific Memory ---
-// We will allocate this memory ourselves. Start with a placeholder.
-#define LAST_LOGIN_STATE_CODE_ADDR      0x0
-#define HANDLE_LOGIN_STATE_CHANGE_FUNC  0x8C53B0 // From analysis
 
 // Represents the current high-level operation the client is performing.
 // Derived from the string array at 0xAB95F0
