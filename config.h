@@ -2,7 +2,7 @@
 #include <cstdint>
 
 // --- Timers and Delays ---
-#define LOGIN_TIMEOUT                   30  // seconds to wait in a connection state before recovering
+#define LOGIN_TIMEOUT                   8  // seconds to wait in a connection state before recovering
 #define RECONNECT_DELAY                 10  // seconds to wait after a recoverable error before retrying
 
 // --- Core Game Functions ---

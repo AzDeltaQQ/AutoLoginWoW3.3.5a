@@ -528,7 +528,34 @@ void WoWAutoLogin::ResetLoginState() {
     else {
         Log("Call to GlueMgr_OnStateChange successful.", "VERBOSE", true);
     }
-    
+
+    // Force the Lua UI to Reset by signaling SET_GLUE_SCREEN event
+    Log("Forcing UI reset by signaling SET_GLUE_SCREEN event to 'login'.", "VERBOSE", true);
+    const char* screenName = "login";
+    DWORD remoteStringAddr = AllocateRemoteMemory(strlen(screenName) + 1);
+    if (!remoteStringAddr) {
+        Log("Failed to allocate memory for screen name string for UI reset.", "ERROR");
+    } else {
+        if (!WriteString(remoteStringAddr, screenName)) {
+            Log("Failed to write screen name string to remote memory for UI reset.", "ERROR");
+        } else {
+            Log("Successfully wrote 'login' string to remote memory at 0x" + std::to_string(remoteStringAddr), "VERBOSE", true);
+            DWORD formatStringAddr = FORMAT_STRING_S_ADDR;
+            bool signalSuccess = CallCdeclFunction(FRAME_SCRIPT_SIGNAL_EVENT_FUNC, { 0, formatStringAddr, remoteStringAddr });
+            if (!signalSuccess) {
+                Log("Call to FrameScript_SignalEvent FAILED during UI reset.", "ERROR");
+            } else {
+                Log("Call to FrameScript_SignalEvent SUCCESSFUL for UI reset.", "VERBOSE", true);
+            }
+        }
+        FreeRemoteMemory(remoteStringAddr);
+    }
+
+    // Explicitly clear error status after reset to ensure clean state
+    Log("Explicitly clearing GLUE_ERROR_OPERATION and GLUE_ERROR_STATUS.", "VERBOSE", true);
+    WriteMemory<ClientOperation>(GLUE_ERROR_OPERATION_ADDR, COP_NONE); // Set to 0
+    WriteMemory<ConnectionStatus>(GLUE_ERROR_STATUS_ADDR, STATUS_NONE); // Set to 0xFFFFFFFF
+
     // Give the client a moment to process the state change before the bot attempts another action.
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     
