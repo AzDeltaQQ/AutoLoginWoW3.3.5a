@@ -37,7 +37,7 @@
 #define CCLIENTCONNECTION_STATUS_OFFSET     0x2F50
 
 // --- Program Settings ---
-#define PROCESS_NAME                    "WowExt.exe"
+#define PROCESS_NAME                    "Project-Epoch.exe"
 #define FUNCTION_CALL_TIMEOUT           5000      // Milliseconds
 #define DEBUG_OUTPUT                    1
 #define VERBOSE_LOGGING                 1

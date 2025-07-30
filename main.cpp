@@ -416,12 +416,14 @@ public:
                     break;
 
                 case ERROR_STATE: {
-                    // Server is down - detected by stuck s_netClient state
-                    Log("Server is down. Retrying in " + std::to_string(RECONNECT_DELAY) + "s.", "WARN");
+                    ConnectionStatus errorStatus = GetDetailedErrorStatus();
+                    Log("Error state detected. Status code: " + std::to_string(errorStatus) + 
+                        ". Resetting and retrying in " + std::to_string(RECONNECT_DELAY) + "s.", "WARN");
                     
-                    ResetLoginState(); // Dismiss any error dialogs
+                    std::this_thread::sleep_for(std::chrono::seconds(2)); // Added delay for visibility
+                    ResetLoginState(); // Safely dismiss any error dialogs and reset state
                     std::this_thread::sleep_for(std::chrono::seconds(RECONNECT_DELAY));
-                    m_loginAttempted = false; // Allow a new attempt
+                    // m_loginAttempted is already set to false inside ResetLoginState
                     break;
                 }
                 
@@ -513,14 +515,29 @@ std::string WoWAutoLogin::ReadGlobalString(DWORD address, size_t maxSize) {
     return "";
 }
 
-ClientState WoWAutoLogin::GetClientState() {
-    // Priority 1: Check for definitive success states.
-    std::string stateStr = ReadGlobalString(GAME_STATE_STRING_ADDR, 64);
-    if (stateStr == "charselect" || stateStr == "charcreate") {
-        return CHARACTER_SELECT;
-    }
+void WoWAutoLogin::ResetLoginState() {
+    Log("Calling GlueMgr_OnStateChange to safely dismiss dialog and clear state...", "ACTION");
 
-    // Priority 2: Check for a specific error dialog being shown by the Glue Manager.
+    // This is the single, correct way to cancel any login operation.
+    // It is the game's native function for handling the "Cancel" button click.
+    // It correctly cleans up the network backend and UI state machine.
+    bool success = CallCdeclFunction(RESET_LOGIN_STATE_FUNC, {});
+    if (!success) {
+        Log("Call to GlueMgr_OnStateChange(0x" + std::to_string(RESET_LOGIN_STATE_FUNC) + ") FAILED. State may be unrecoverable.", "ERROR");
+    }
+    else {
+        Log("Call to GlueMgr_OnStateChange successful.", "VERBOSE", true);
+    }
+    
+    // Give the client a moment to process the state change before the bot attempts another action.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    
+    // Allow a new login attempt after the reset.
+    m_loginAttempted = false;
+}
+
+ClientState WoWAutoLogin::GetClientState() {
+    // Priority 1: Check for a specific error dialog being shown by the Glue Manager.
     // This is the most reliable way to detect "Unable to connect", "Disconnected", etc.
     ClientOperation glueErrorOp = ReadMemory<ClientOperation>(GLUE_ERROR_OPERATION_ADDR);
     if (glueErrorOp == COP_FAILED) {
@@ -528,170 +545,47 @@ ClientState WoWAutoLogin::GetClientState() {
         return ERROR_STATE;
     }
 
-    // Priority 3: Check the s_netClient object for in-progress operations.
-    DWORD pNetClient = ReadMemory<DWORD>(NETCLIENT_PTR_ADDR);
-    
-    // Server down detection: If we can't read the network client pointer or it's invalid
-    if (!pNetClient || pNetClient < 0x1000000 || pNetClient > 0x7FFFFFFF) {
-        if (m_loginAttempted) {
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_loginAttemptTime).count();
-            
-            if (elapsed > 3000) { // Wait 3 seconds before declaring server down
-                Log("Server down detected: Invalid NETCLIENT_PTR (0x" + std::to_string(pNetClient) + ") after " + std::to_string(elapsed) + "ms", "INFO");
-                return ERROR_STATE;
-            } else {
-                Log("Ignoring invalid NETCLIENT_PTR: 0x" + std::to_string(pNetClient) + " (only " + std::to_string(elapsed) + "ms since login)", "VERBOSE", true);
-            }
-        }
-        return AT_LOGIN_SCREEN; // Can't determine state, assume login screen
-    }
-    
-    // Try to read the operation and status
-    ClientOperation op = ReadMemory<ClientOperation>(pNetClient + CCLIENTCONNECTION_OPERATION_OFFSET);
-    ConnectionStatus status = ReadMemory<ConnectionStatus>(pNetClient + CCLIENTCONNECTION_STATUS_OFFSET);
-
-    // Server down detection: Check for garbage memory values ONLY if a login was attempted.
-    if (m_loginAttempted && (op < 0 || op > 100)) { // A more reasonable range check.
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_loginAttemptTime).count();
-        
-        if (elapsed > 3000) { // Wait 3 seconds before declaring server down
-            Log("Server down detected: Garbage ClientOperation value: " + std::to_string(op) + " after " + std::to_string(elapsed) + "ms", "INFO");
-            return ERROR_STATE;
-        } else {
-            Log("Ignoring garbage ClientOperation value: " + std::to_string(op) + " (only " + std::to_string(elapsed) + "ms since login)", "VERBOSE", true);
-        }
+    // Priority 2: Check for definitive success states via the UI screen string.
+    std::string stateStr = ReadGlobalString(GAME_STATE_STRING_ADDR, 64);
+    if (stateStr == "charselect" || stateStr == "charcreate") {
+        return CHARACTER_SELECT;
     }
 
-    // Check for normal progress states.
-    switch (op) {
-        case COP_CONNECT:
-        case COP_HANDSHAKE:
-        case COP_AUTHENTICATE:
+    // Priority 3: Check the integer login state for progress.
+    int loginState = ReadMemory<int>(GLUE_LOGIN_STATE_ADDR);
+    switch (loginState) {
+        case 1:  // CONNECTING_TO_AUTH
             return CONNECTING_TO_AUTH;
-        case COP_AUTHENTICATED:
-            return AUTH_SUCCESS;
-        case COP_GET_REALMS:
-            return REALM_LIST;
-        case COP_LOGIN_CHARACTER:
+        case 2:  // CONNECTING_TO_REALM
             return CONNECTING_TO_REALM;
+        case 4:  // RETRIEVING_REALMLIST
+            return REALM_LIST;
+        case 3:  // RETRIEVING_CHARLIST (can sometimes happen after realm list)
+            return AUTH_SUCCESS; // Treat as part of the post-auth process
     }
-    
-    // Fallback: If nothing else is detected, we are at the login screen.
+
+    // Priority 4: NEW - Detect implicit failure (server down).
+    // If we have attempted a login, but the loginState has been reset to 0 without
+    // reaching charselect or triggering a glueErrorOp, it means the connection
+    // timed out internally. This is the "server down" case.
+    if (m_loginAttempted && loginState == 0 && stateStr == "login") {
+        Log("Detected implicit error state (login attempted but state is idle).", "VERBOSE", true);
+        return ERROR_STATE;
+    }
+
+    // Fallback: If no operations are active, we are at the login screen.
     return AT_LOGIN_SCREEN;
 }
 
 ConnectionStatus WoWAutoLogin::GetDetailedErrorStatus() {
-    // First, check the global UI error variable. This is often set for dialogs.
+    // The global UI error status is the most reliable indicator for what the user sees.
     ConnectionStatus glueError = ReadMemory<ConnectionStatus>(GLUE_ERROR_STATUS_ADDR);
-    std::stringstream ss;
-    ss << "Read GLUE_ERROR_STATUS at 0x" << std::hex << GLUE_ERROR_STATUS_ADDR << " = " << std::dec << glueError;
-    Log(ss.str(), "MEMORY", true);
-    
-    if (glueError != STATUS_NONE && glueError >= 0) {
+    if (glueError != STATUS_NONE && glueError != 0) {
         return glueError;
     }
-
-    // If that's not set, check the s_netClient object's internal status.
-    DWORD pNetClient = ReadMemoryWithLog<DWORD>(NETCLIENT_PTR_ADDR, "NETCLIENT_PTR");
-    if (pNetClient) { // Try to read from the pointer regardless
-        ClientOperation op = ReadMemory<ClientOperation>(pNetClient + CCLIENTCONNECTION_OPERATION_OFFSET);
-        ConnectionStatus status = ReadMemory<ConnectionStatus>(pNetClient + CCLIENTCONNECTION_STATUS_OFFSET);
-        
-        // Log the operation and status reads
-        std::stringstream ss;
-        ss << "Read ClientOperation at 0x" << std::hex << (pNetClient + CCLIENTCONNECTION_OPERATION_OFFSET) << " = " << std::dec << op;
-        Log(ss.str(), "MEMORY", true);
-        
-        ss.str("");
-        ss << "Read ConnectionStatus at 0x" << std::hex << (pNetClient + CCLIENTCONNECTION_STATUS_OFFSET) << " = " << std::dec << status;
-        Log(ss.str(), "MEMORY", true);
-        
-        if (op == COP_FAILED) {
-            return status;
-        }
-        
-        // NEW: Handle the stuck state where op = 0 with garbage status
-        if (op == COP_NONE) {
-            ConnectionStatus status = ReadMemory<ConnectionStatus>(pNetClient + CCLIENTCONNECTION_STATUS_OFFSET);
-            if (status > 1000) {
-                // This is the "Unable to connect" failure pattern
-                return RESPONSE_FAILED_TO_CONNECT;
-            }
-        }
-        
-        // NEW: Handle the server-down pattern where op is garbage
-        if (op > 1000) {
-            ConnectionStatus status = ReadMemory<ConnectionStatus>(pNetClient + CCLIENTCONNECTION_STATUS_OFFSET);
-            if (status == 0) {
-                // This is the server-down failure pattern
-                return RESPONSE_FAILED_TO_CONNECT;
-            }
-        }
-    }
-
-    // If we are in an error state but have no code, it's the inferred "stuck" state.
-    // Default to a generic connection failure.
+    
+    // As a fallback, just return a generic failure.
     return RESPONSE_FAILED_TO_CONNECT;
-}
-
-void WoWAutoLogin::ResetLoginState() {
-    Log("Calling reset function to dismiss dialog and clear state...", "ACTION");
-
-    // --- STEP 1: Clean up the C++ and Network Backend ---
-    Log("Forcing g_LoginState to 1 for backend cleanup.", "VERBOSE", true);
-    if (!WriteMemory<int>(GLUE_LOGIN_STATE_ADDR, 1)) {
-        Log("Failed to write to g_LoginState, cancellation may fail.", "ERROR");
-    }
-    // Call the original cancel function. We don't need to wait for it.
-    CallCdeclFunction(RESET_LOGIN_STATE_FUNC, {});
-    std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Give it a moment to start.
-
-    // --- STEP 2: Force the Lua UI to Reset ---
-    Log("Forcing UI reset by signaling SET_GLUE_SCREEN event.", "VERBOSE", true);
-    
-    // We need to pass the string "login" to the function.
-    // To do this, we must allocate memory for it inside the WoW process.
-    const char* screenName = "login";
-    DWORD remoteStringAddr = AllocateRemoteMemory(strlen(screenName) + 1);
-    if (!remoteStringAddr) {
-        Log("Failed to allocate memory for screen name string.", "ERROR");
-        m_loginAttempted = false;
-        return;
-    }
-
-    if (!WriteString(remoteStringAddr, screenName)) {
-        Log("Failed to write screen name string to remote memory.", "ERROR");
-        FreeRemoteMemory(remoteStringAddr);
-        m_loginAttempted = false;
-        return;
-    } else {
-        Log("Successfully wrote 'login' string to remote memory at 0x" + std::to_string(remoteStringAddr), "VERBOSE", true);
-    }
-
-    // Now, call FrameScript_SignalEvent(0, "%s", remoteStringAddr)
-    // Event 0 = "SET_GLUE_SCREEN"
-    // %s = format specifier
-    // remoteStringAddr = pointer to our "login" string
-    DWORD formatStringAddr = FORMAT_STRING_S_ADDR; // Use the definition from config.h
-    Log("Calling FrameScript_SignalEvent(0, 0x" + std::to_string(formatStringAddr) + ", 0x" + std::to_string(remoteStringAddr) + ")", "VERBOSE", true);
-    
-    bool success = CallCdeclFunction(FRAME_SCRIPT_SIGNAL_EVENT_FUNC, { 0, formatStringAddr, remoteStringAddr });
-    if (!success) {
-        Log("Call to FrameScript_SignalEvent FAILED.", "ERROR");
-    } else {
-        Log("Call to FrameScript_SignalEvent SUCCESSFUL.", "VERBOSE", true);
-    }
-
-    // Clean up the memory we allocated.
-    FreeRemoteMemory(remoteStringAddr);
-    
-    // Give the UI a brief moment to execute the screen change.
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    
-    // Now, we can safely allow a new login attempt.
-    m_loginAttempted = false;
 }
 
 // Ctrl+C handler function
