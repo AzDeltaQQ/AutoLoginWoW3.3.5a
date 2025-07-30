@@ -45,9 +45,13 @@ class Logger {
 private:
     std::ofstream logFile;
     std::string logFileName;
+public:
+    bool isLoggingEnabled; // Changed to public
     
 public:
-    Logger() {
+    Logger() : isLoggingEnabled(LOGGING_ENABLED) { // Initialize with macro value
+        if (!isLoggingEnabled) return; // Exit if logging is disabled
+
         // Create log file with timestamp
         auto now = std::chrono::system_clock::now();
         time_t time_t_now = std::chrono::system_clock::to_time_t(now);
@@ -65,6 +69,7 @@ public:
     }
     
     ~Logger() {
+        if (!isLoggingEnabled) return; // Exit if logging is disabled
         if (logFile.is_open()) {
             logFile << "=== WoW Auto-Login Log Ended ===" << std::endl;
             logFile.close();
@@ -72,6 +77,7 @@ public:
     }
     
     void Log(const std::string& message, const std::string& level = "INFO") {
+        if (!isLoggingEnabled) return; // Exit if logging is disabled
         if (logFile.is_open()) {
             auto now = std::chrono::system_clock::now();
             auto time_t_now = std::chrono::system_clock::to_time_t(now);
@@ -128,6 +134,7 @@ public:
     }
 
     void Log(const std::string& message, const std::string& level = "INFO", bool verbose = false) {
+        if (!logger.isLoggingEnabled) return; // Corrected: Access through logger object
         if (!verbose || (DEBUG_OUTPUT && VERBOSE_LOGGING)) {
             logger.Log(message, level);
         }
@@ -422,6 +429,11 @@ public:
                     
                     std::this_thread::sleep_for(std::chrono::seconds(2)); // Added delay for visibility
                     ResetLoginState(); // Safely dismiss any error dialogs and reset state
+
+                    // NEW: Add a short delay after reset to visually confirm dialog clear
+                    Log("Giving UI a moment to clear after reset...", "VERBOSE", true);
+                    std::this_thread::sleep_for(std::chrono::seconds(1)); // Add 1 second delay here
+
                     std::this_thread::sleep_for(std::chrono::seconds(RECONNECT_DELAY));
                     // m_loginAttempted is already set to false inside ResetLoginState
                     break;
@@ -541,7 +553,8 @@ void WoWAutoLogin::ResetLoginState() {
         } else {
             Log("Successfully wrote 'login' string to remote memory at 0x" + std::to_string(remoteStringAddr), "VERBOSE", true);
             DWORD formatStringAddr = FORMAT_STRING_S_ADDR;
-            bool signalSuccess = CallCdeclFunction(FRAME_SCRIPT_SIGNAL_EVENT_FUNC, { 0, formatStringAddr, remoteStringAddr });
+            // Changed event ID from 0 to 5 as per user's suggestion
+            bool signalSuccess = CallCdeclFunction(FRAME_SCRIPT_SIGNAL_EVENT_FUNC, { 5, formatStringAddr, remoteStringAddr });
             if (!signalSuccess) {
                 Log("Call to FrameScript_SignalEvent FAILED during UI reset.", "ERROR");
             } else {
