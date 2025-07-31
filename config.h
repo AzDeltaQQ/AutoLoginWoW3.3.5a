@@ -46,7 +46,7 @@
 #define MEMORY_PROTECTION               PAGE_EXECUTE_READWRITE
 
 // --- Logging Settings ---
-#define LOGGING_ENABLED                 1 // Set to 1 to enable logging, 0 to disable
+#define LOGGING_ENABLED                1 // Set to 1 to enable logging, 0 to disable
 
 // Represents the current high-level operation the client is performing.
 // Derived from the string array at 0xAB95F0

@@ -10,7 +10,14 @@
 #include <iomanip>
 #include <time.h>
 #include <cstddef> // For ptrdiff_t
+#include <stdexcept> // For std::runtime_error
 #include "config.h"
+
+// Custom exception for memory read failures
+class MemoryReadException : public std::runtime_error {
+public:
+    MemoryReadException(const std::string& message) : std::runtime_error(message) {}
+};
 
 // Enhanced client state enumeration with more detailed states
 enum ClientState {
@@ -204,20 +211,22 @@ public:
         return true;
     }
 
+    // Updated ReadMemory and ReadMemoryWithLog to throw on failure
     template<typename T>
     T ReadMemory(DWORD address) {
         T value{}; // Initialize to zero
         if (!ReadProcessMemory(processHandle, (LPCVOID)address, &value, sizeof(T), NULL)) {
             std::stringstream ss;
-            ss << "Server is down - cannot read memory at address 0x" << std::hex << address;
-            Log(ss.str(), "VERBOSE", true);
+            ss << "Failed to read memory at address 0x" << std::hex << address << ". Error: " << GetLastError();
+            Log(ss.str(), "ERROR"); // Always log this critical error
+            throw MemoryReadException(ss.str());
         }
         return value;
     }
 
     template<typename T>
     T ReadMemoryWithLog(DWORD address, const std::string& varName) {
-        T value = ReadMemory<T>(address);
+        T value = ReadMemory<T>(address); // Calls the updated ReadMemory
         std::stringstream ss;
         ss << "Read " << varName << " at 0x" << std::hex << address << " = ";
         
@@ -378,6 +387,14 @@ public:
         bool realmSelectAttempted = false;
 
         while (isRunning) {
+            // Check if the WoW process is still running
+            DWORD exitCode = 0;
+            if (GetExitCodeProcess(processHandle, &exitCode) && exitCode != STILL_ACTIVE) {
+                Log("WoW process has terminated (Exit Code: " + std::to_string(exitCode) + "). Shutting down bot.", "FATAL");
+                isRunning = false;
+                break; // Exit main loop
+            }
+
             // Log all global variables every 10 seconds for debugging
             static auto lastGlobalVarLog = std::chrono::steady_clock::now();
             auto now = std::chrono::steady_clock::now();
@@ -504,17 +521,24 @@ WoWAutoLogin* WoWAutoLogin::instance = nullptr;
 
 // Member function definitions outside the class
 ConnectionStatus WoWAutoLogin::GetGlueErrorStatus() {
-    ConnectionStatus status = ReadMemory<ConnectionStatus>(GLUE_ERROR_STATUS_ADDR);
-    std::stringstream ss;
-    ss << "Read GLUE_ERROR_STATUS at 0x" << std::hex << GLUE_ERROR_STATUS_ADDR << " = " << std::dec << status;
-    Log(ss.str(), "MEMORY", true);
-    return status;
+    try {
+        ConnectionStatus glueError = ReadMemory<ConnectionStatus>(GLUE_ERROR_STATUS_ADDR);
+        if (glueError != STATUS_NONE && glueError != 0) {
+            return glueError;
+        }
+        
+        // As a fallback, just return a generic failure.
+        return RESPONSE_FAILED_TO_CONNECT;
+    } catch (const MemoryReadException& e) {
+        Log("Critical memory read error in GetDetailedErrorStatus: " + std::string(e.what()), "FATAL");
+        return RESPONSE_FAILED_TO_CONNECT; // Indicate failure
+    }
 }
 
 std::string WoWAutoLogin::ReadGlobalString(DWORD address, size_t maxSize) {
     std::vector<char> buffer(maxSize);
     if (ReadProcessMemory(processHandle, (LPCVOID)address, buffer.data(), maxSize, NULL)) {
-        buffer[maxSize - 1] = '\0';
+        buffer[maxSize - 1] = '\0'; // Changed from '\000' to '\0'
         std::string result = std::string(buffer.data());
         std::stringstream ss;
         ss << "Read global string at 0x" << std::hex << address << " = '" << result << "'";
@@ -522,9 +546,9 @@ std::string WoWAutoLogin::ReadGlobalString(DWORD address, size_t maxSize) {
         return result;
     }
     std::stringstream ss;
-    ss << "Failed to read global string at 0x" << std::hex << address;
-    Log(ss.str(), "MEMORY", true);
-    return "";
+    ss << "Failed to read global string at 0x" << std::hex << address << ". Error: " << GetLastError();
+    Log(ss.str(), "ERROR"); // Always log this critical error
+    throw MemoryReadException(ss.str());
 }
 
 void WoWAutoLogin::ResetLoginState() {
@@ -577,55 +601,64 @@ void WoWAutoLogin::ResetLoginState() {
 }
 
 ClientState WoWAutoLogin::GetClientState() {
-    // Priority 1: Check for a specific error dialog being shown by the Glue Manager.
-    // This is the most reliable way to detect "Unable to connect", "Disconnected", etc.
-    ClientOperation glueErrorOp = ReadMemory<ClientOperation>(GLUE_ERROR_OPERATION_ADDR);
-    if (glueErrorOp == COP_FAILED) {
-        Log("Detected error state via GLUE_ERROR_OPERATION.", "VERBOSE", true);
-        return ERROR_STATE;
-    }
+    try {
+        // Priority 1: Check for a specific error dialog being shown by the Glue Manager.
+        ClientOperation glueErrorOp = ReadMemory<ClientOperation>(GLUE_ERROR_OPERATION_ADDR);
+        if (glueErrorOp == COP_FAILED) {
+            Log("Detected error state via GLUE_ERROR_OPERATION.", "VERBOSE", true);
+            return ERROR_STATE;
+        }
 
-    // Priority 2: Check for definitive success states via the UI screen string.
-    std::string stateStr = ReadGlobalString(GAME_STATE_STRING_ADDR, 64);
-    if (stateStr == "charselect" || stateStr == "charcreate") {
-        return CHARACTER_SELECT;
-    }
+        // Priority 2: Check for definitive success states via the UI screen string.
+        std::string stateStr = ReadGlobalString(GAME_STATE_STRING_ADDR, 64);
+        if (stateStr == "charselect" || stateStr == "charcreate") {
+            return CHARACTER_SELECT;
+        }
 
-    // Priority 3: Check the integer login state for progress.
-    int loginState = ReadMemory<int>(GLUE_LOGIN_STATE_ADDR);
-    switch (loginState) {
-        case 1:  // CONNECTING_TO_AUTH
-            return CONNECTING_TO_AUTH;
-        case 2:  // CONNECTING_TO_REALM
-            return CONNECTING_TO_REALM;
-        case 4:  // RETRIEVING_REALMLIST
-            return REALM_LIST;
-        case 3:  // RETRIEVING_CHARLIST (can sometimes happen after realm list)
-            return AUTH_SUCCESS; // Treat as part of the post-auth process
-    }
+        // Priority 3: Check the integer login state for progress.
+        int loginState = ReadMemory<int>(GLUE_LOGIN_STATE_ADDR);
+        switch (loginState) {
+            case 1:  // CONNECTING_TO_AUTH
+                return CONNECTING_TO_AUTH;
+            case 2:  // CONNECTING_TO_REALM
+                return CONNECTING_TO_REALM;
+            case 4:  // RETRIEVING_REALMLIST
+                return REALM_LIST;
+            case 3:  // RETRIEVING_CHARLIST (can sometimes happen after realm list)
+                return AUTH_SUCCESS; // Treat as part of the post-auth process
+        }
 
-    // Priority 4: NEW - Detect implicit failure (server down).
-    // If we have attempted a login, but the loginState has been reset to 0 without
-    // reaching charselect or triggering a glueErrorOp, it means the connection
-    // timed out internally. This is the "server down" case.
-    if (m_loginAttempted && loginState == 0 && stateStr == "login") {
-        Log("Detected implicit error state (login attempted but state is idle).", "VERBOSE", true);
-        return ERROR_STATE;
-    }
+        // Priority 4: NEW - Detect implicit failure (server down).
+        // If we have attempted a login, but the loginState has been reset to 0 without
+        // reaching charselect or triggering a glueErrorOp, it means the connection
+        // timed out internally. This is the "server down" case.
+        if (m_loginAttempted && loginState == 0 && stateStr == "login") {
+            Log("Detected implicit error state (login attempted but state is idle).", "VERBOSE", true);
+            return ERROR_STATE;
+        }
 
-    // Fallback: If no operations are active, we are at the login screen.
-    return AT_LOGIN_SCREEN;
+        // Fallback: If no operations are active, we are at the login screen.
+        return AT_LOGIN_SCREEN;
+    } catch (const MemoryReadException& e) {
+        Log("Critical memory read error in GetClientState: " + std::string(e.what()), "FATAL");
+        return ERROR_STATE; // Force into error state for recovery attempt
+    }
 }
 
 ConnectionStatus WoWAutoLogin::GetDetailedErrorStatus() {
-    // The global UI error status is the most reliable indicator for what the user sees.
-    ConnectionStatus glueError = ReadMemory<ConnectionStatus>(GLUE_ERROR_STATUS_ADDR);
-    if (glueError != STATUS_NONE && glueError != 0) {
-        return glueError;
+    try {
+        // The global UI error status is the most reliable indicator for what the user sees.
+        ConnectionStatus glueError = ReadMemory<ConnectionStatus>(GLUE_ERROR_STATUS_ADDR);
+        if (glueError != STATUS_NONE && glueError != 0) {
+            return glueError;
+        }
+        
+        // As a fallback, just return a generic failure.
+        return RESPONSE_FAILED_TO_CONNECT;
+    } catch (const MemoryReadException& e) {
+        Log("Critical memory read error in GetDetailedErrorStatus: " + std::string(e.what()), "FATAL");
+        return RESPONSE_FAILED_TO_CONNECT; // Indicate failure
     }
-    
-    // As a fallback, just return a generic failure.
-    return RESPONSE_FAILED_TO_CONNECT;
 }
 
 // Ctrl+C handler function
